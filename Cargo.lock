@@ -1463,6 +1463,7 @@ dependencies = [
  "xdg",
  "xdg-mime",
  "xdgen",
+ "zbus 5.19.0",
  "zip",
 ]
 

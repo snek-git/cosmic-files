@@ -21,6 +21,7 @@ pub mod clipboard;
 pub mod config;
 mod context_action;
 pub mod dialog;
+mod file_manager1;
 mod key_bind;
 pub(crate) mod large_image;
 pub(crate) mod load_image;
@@ -149,6 +150,10 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(log_layer)
         .init();
+
+    if env::args().nth(1).as_deref() == Some("--file-manager1") {
+        return file_manager1::serve();
+    }
 
     localize::localize();
 
