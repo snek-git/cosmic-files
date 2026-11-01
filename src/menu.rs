@@ -144,6 +144,7 @@ pub fn context_menu(
             | Location::Search(SearchLocation::Path(..), ..)
             | Location::Search(SearchLocation::Recents, ..)
             | Location::Recents
+            | Location::Inbox
             | Location::Network(_, _, Some(_)),
         ) => {
             if selected_trash_only {
@@ -193,6 +194,12 @@ pub fn context_menu(
                         fl!("open-item-location"),
                         Action::OpenItemLocation,
                     ));
+                }
+                if selected == 1 && selected_dir == 0 {
+                    children.push(menu_item(fl!("find-similar"), Action::FindSimilar));
+                }
+                if selected == 1 && selected_dir == 1 {
+                    children.push(menu_item(fl!("folder-summary"), Action::EditSummary));
                 }
                 // All selected items are directories
                 if selected == selected_dir && matches!(tab.mode, tab::Mode::App) {
@@ -325,6 +332,7 @@ pub fn context_menu(
             | Location::Search(SearchLocation::Path(..), ..)
             | Location::Search(SearchLocation::Recents, ..)
             | Location::Recents
+            | Location::Inbox
             | Location::Network(_, _, Some(_)),
         ) => {
             if selected > 0 {
@@ -677,6 +685,12 @@ pub fn menu_bar<'a>(
                             None,
                             tab_opt.is_some_and(|tab| matches!(tab.config.view, tab::View::List)),
                             Action::TabViewList,
+                        ),
+                        menu::Item::CheckBox(
+                            fl!("map-view"),
+                            None,
+                            tab_opt.is_some_and(tab::Tab::map_open),
+                            Action::TabViewMap,
                         ),
                         menu::Item::Divider,
                         menu::Item::CheckBox(

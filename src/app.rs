@@ -160,6 +160,10 @@ pub enum Action {
     ItemUp,
     LocationUp,
     MoveTo,
+    FindSimilar,
+    AriadneUndo,
+    AriadneNext,
+    EditSummary,
     NewFile,
     NewFolder,
     Open,
@@ -187,6 +191,7 @@ pub enum Action {
     TabNext,
     TabPrev,
     TabViewGrid,
+    TabViewMap,
     TabViewList,
     ToggleFoldersFirst,
     ToggleShowHidden,
@@ -235,6 +240,10 @@ impl Action {
             Self::ItemUp => Message::TabMessage(entity_opt, tab::Message::ItemUp),
             Self::LocationUp => Message::TabMessage(entity_opt, tab::Message::LocationUp),
             Self::MoveTo => Message::MoveTo(entity_opt),
+            Self::FindSimilar => Message::FindSimilar(entity_opt),
+            Self::AriadneUndo => Message::AriadneUndo(None),
+            Self::AriadneNext => Message::TabMessage(entity_opt, tab::Message::AriadneNext),
+            Self::EditSummary => Message::TabMessage(entity_opt, tab::Message::SummaryEdit),
             Self::NewFile => Message::NewItem(entity_opt, false),
             Self::NewFolder => Message::NewItem(entity_opt, true),
             Self::Open => Message::TabMessage(entity_opt, tab::Message::Open(None)),
@@ -266,6 +275,7 @@ impl Action {
             Self::TabNext => Message::TabNext,
             Self::TabPrev => Message::TabPrev,
             Self::TabViewGrid => Message::TabView(entity_opt, tab::View::Grid),
+            Self::TabViewMap => Message::TabMessage(entity_opt, tab::Message::MapToggle),
             Self::TabViewList => Message::TabView(entity_opt, tab::View::List),
             Self::ToggleFoldersFirst => Message::ToggleFoldersFirst,
             Self::ToggleShowHidden => Message::ToggleShowHidden,
@@ -330,6 +340,23 @@ impl MenuAction for NavMenuAction {
     }
 }
 
+/// The Tidy panel's width: the detail panel's, so the sheet keeps its shape when it opens.
+const TIDY_WIDTH: f32 = 360.0;
+/// Settings needs room for a path field beside its label.
+const SETTINGS_WIDTH: f32 = 480.0;
+
+/// The same menu actions for the places panel, which lives in the app's own view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Place(NavMenuAction);
+
+impl MenuAction for Place {
+    type Message = Message;
+
+    fn message(&self) -> Self::Message {
+        Message::NavMenuAction(self.0)
+    }
+}
+
 /// Messages that are used specifically by our [`App`].
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -372,6 +399,8 @@ pub enum Message {
     NavBarClose(Entity),
     NavBarContext(Entity),
     NavMenuAction(NavMenuAction),
+    /// A place chosen in the places panel (the palette theme's own nav bar).
+    NavPlace(Entity),
     NetworkAuth(MounterKey, String, MounterAuth, mpsc::Sender<MounterAuth>),
     NetworkDriveInput(String),
     NetworkDriveOpenEntityAfterMount {
@@ -391,6 +420,7 @@ pub enum Message {
     OpenInNewTab(Option<Entity>),
     OpenInNewWindow(Option<Entity>),
     OpenItemLocation(Option<Entity>),
+    FindSimilar(Option<Entity>),
     OpenWithBrowse,
     OpenWithDialog(Option<Entity>),
     OpenWithSelection(usize),
@@ -424,6 +454,37 @@ pub enum Message {
     ReloadMimeAppCache,
     ReorderTab(ReorderEvent),
     RescanRecents,
+    /// The ariadne Inbox changed; the number is how many suggestions wait.
+    InboxChanged(usize),
+    /// The palette file changed on disk: rebuild the theme.
+    PaletteChanged,
+    /// The daemon's inbox or thread changed; the snapshot is already stored.
+    AriadneChanged,
+    /// The status line has something new to say.
+    AriadneActivity(crate::ariadne::Activity),
+    /// Type one more character of the status line.
+    StatusTick,
+    /// An animation frame for open maps.
+    MapFrame(Instant),
+    /// Redraw while the cursor's arrival flash runs.
+    FlashTick,
+    /// Open (or close) the card of a knot on the undo thread.
+    KnotCard(Option<u64>),
+    /// Undo a move: the one that put a file at this path, or the newest.
+    AriadneUndo(Option<PathBuf>),
+    /// Tidy list: make one change, skip it for 30 days, make them all, rename a new folder.
+    TidyApply(String),
+    TidySkip(String),
+    TidyAll,
+    TidyName(String, String),
+    PaletteInput(String),
+    PaletteSubmit,
+    FontInput(String),
+    FontSubmit,
+    IconsInput(String),
+    IconsSubmit,
+    SetMotion(bool),
+    SetSound(bool),
     RescanTrash,
     RemoveFromRecents(Option<Entity>),
     Rename(Option<Entity>),
@@ -492,6 +553,8 @@ pub enum ContextPage {
     NetworkDrive,
     Preview(Option<Entity>, PreviewKind),
     Settings,
+    /// Every change ariadne would make, spelled out, one button each.
+    Tidy,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -763,6 +826,19 @@ pub struct App {
     )>,
     windows: FxHashMap<window::Id, Window>,
     nav_dnd_hover: Option<(Location, Instant)>,
+    /// ariadne suggestions waiting in the Inbox, shown next to its sidebar entry.
+    inbox_count: usize,
+    /// The palette file path as typed in Settings, saved on Enter.
+    palette_input: String,
+    font_input: String,
+    icons_input: String,
+    /// The status line, and how much of it is typed out so far.
+    status: crate::ariadne::Activity,
+    status_shown: usize,
+    /// The knot whose card is open.
+    knot_card: Option<u64>,
+    /// New folder names edited in the Tidy list, by proposal id.
+    tidy_names: HashMap<String, String>,
     tab_dnd_hover: Option<(Entity, Instant)>,
     type_select_prefix: String,
     type_select_last_key: Option<Instant>,
@@ -1562,6 +1638,471 @@ impl App {
         Task::batch(commands)
     }
 
+    /// Refetch what the daemon knows right after acting, instead of waiting for the next poll.
+    fn refresh_ariadne(&mut self) {
+        if let Some(snapshot) = crate::ariadne::fetch() {
+            self.inbox_count = snapshot.waiting();
+            crate::ariadne::set_snapshot(std::sync::Arc::new(snapshot));
+        }
+    }
+
+    /// The new folder name for a group: as edited, else ariadne's own.
+    fn tidy_name(&self, id: &str) -> Option<String> {
+        self.tidy_names.get(id).cloned().or_else(|| {
+            crate::ariadne::snapshot()
+                .proposals
+                .iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.name.clone())
+        })
+    }
+
+    /// Tidy: each change as a sentence with where things go, its own button, and Skip.
+    fn tidy(&self) -> Element<'_, Message> {
+        let snapshot = crate::ariadne::snapshot();
+        let mut column = widget::column::with_capacity(snapshot.proposals.len() + 4).spacing(8);
+        let mut proposals: Vec<_> = snapshot.proposals.iter().collect();
+        proposals.sort_by_key(|p| p.kind.clone());
+        let mut kind = "";
+        for p in proposals {
+            // One section per kind, with its count, as the Transcripts sheet labels its lists.
+            if p.kind != kind && crate::palette::ladder().is_some() {
+                kind = &p.kind;
+                let n = snapshot.proposals.iter().filter(|q| q.kind == kind).count();
+                column = column.push(crate::ariadne_ui::section(&format!("{kind}  {n:02}")));
+            }
+            // A plate per idea: its kind as a tag with the gold edge and how sure, what it is
+            // about, where things go, why Opus agreed, then the buttons.
+            use crate::ariadne_ui::{clip, small_text, tag};
+            let id = p.id.clone();
+            let mut lines = widget::column::with_capacity(6).spacing(4).push(
+                widget::row::with_children([
+                    tag(p.action(), true),
+                    widget::space::horizontal().into(),
+                    small_text(&format!("{:.0}%", p.confidence * 100.0), crate::yorha::Tone::Secondary),
+                ])
+                .align_y(Alignment::Center),
+            );
+            lines = lines.push(
+                crate::palette::body(clip(&p.subject(), 40))
+                    .wrapping(cosmic::iced::widget::text::Wrapping::None),
+            );
+            lines = lines.push(
+                widget::text::caption(p.route())
+                    .class(crate::palette::secondary())
+                    .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph),
+            );
+            if let Some(reason) = p.reason.as_deref().filter(|r| !r.is_empty()) {
+                lines = lines.push(
+                    widget::text::caption(reason.to_string())
+                        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph),
+                );
+            }
+            if p.kind == "group" {
+                lines = lines.push(
+                    widget::text_input("", self.tidy_name(&p.id).unwrap_or_default())
+                        .on_input(move |name| Message::TidyName(id.clone(), name))
+                        .width(Length::Fill),
+                );
+            }
+            lines = lines.push(
+                widget::row::with_children([
+                    widget::space::horizontal().into(),
+                    crate::palette::act(p.action())
+                        .on_press(Message::TidyApply(p.id.clone()))
+                        .into(),
+                    crate::palette::quiet(fl!("tidy-skip"))
+                        .on_press(Message::TidySkip(p.id.clone()))
+                        .into(),
+                ])
+                .spacing(8)
+                .padding([4, 0, 0, 0]),
+            );
+            column = column.push(
+                widget::container(lines)
+                    .padding([8, 10])
+                    .width(Length::Fill)
+                    .class(crate::palette::row_plate()),
+            );
+        }
+        column.into()
+    }
+
+    /// The Tidy list as its own panel under the palette theme, beside the items as the detail
+    /// panel is: a header slab with the count, Do all and Close, then the ideas by kind.
+    fn tidy_panel(&self) -> Element<'_, Message> {
+        let n = crate::ariadne::snapshot().proposals.len();
+        let mut bar = Vec::with_capacity(1);
+        if n > 1 {
+            bar.push(crate::palette::act(fl!("tidy-all")).on_press(Message::TidyAll).into());
+        }
+        let list: Element<_> = if n == 0 {
+            crate::ariadne_ui::section(&fl!("tidy-empty"))
+        } else {
+            self.tidy()
+        };
+        self.side_panel(ContextPage::Tidy, "tidy", format!("{n:02}"), bar, list, TIDY_WIDTH)
+    }
+
+    /// A page beside the items under the palette theme, where COSMIC would open a drawer: the
+    /// header slab, a bar of actions ending in Close, then the page, scrolling.
+    fn side_panel<'a>(
+        &'a self,
+        page: ContextPage,
+        label: &str,
+        value: String,
+        mut bar: Vec<Element<'a, Message>>,
+        content: Element<'a, Message>,
+        width: f32,
+    ) -> Element<'a, Message> {
+        bar.push(widget::space::horizontal().into());
+        bar.push(
+            crate::palette::quiet(fl!("tidy-close"))
+                .on_press(Message::ToggleContextPage(page))
+                .into(),
+        );
+        let bar = widget::row::with_children(bar).spacing(8).align_y(Alignment::Center);
+        widget::container(widget::column::with_children([
+            crate::ariadne_ui::header(label, value),
+            widget::container(
+                widget::column::with_children([
+                    bar.into(),
+                    widget::scrollable(widget::container(content).padding([0, 10, 0, 0]))
+                        .class(cosmic::style::iced::Scrollable::Minimal)
+                        .height(Length::Fill)
+                        .into(),
+                ])
+                .spacing(8),
+            )
+            .padding([8, 8, 8, 8])
+            .height(Length::Fill)
+            .into(),
+        ]))
+        .class(crate::palette::panel())
+        .width(Length::Fixed(width))
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// The page open beside the items under the palette theme, if any.
+    fn side_page(&self) -> Option<Element<'_, Message>> {
+        if !self.core.window.show_context || crate::palette::ladder().is_none() {
+            return None;
+        }
+        match self.context_page {
+            ContextPage::Tidy => Some(self.tidy_panel()),
+            ContextPage::Settings => Some(self.side_panel(
+                ContextPage::Settings,
+                &fl!("settings"),
+                String::new(),
+                Vec::new(),
+                self.settings(),
+                SETTINGS_WIDTH,
+            )),
+            _ => None,
+        }
+    }
+
+    /// The sidebar under the palette theme: a panel with a header slab, places as plates, the
+    /// current one in the one dark. The same parts as COSMIC's nav bar, so drops, the context
+    /// menu, middle click and eject all still work.
+    fn places(&self) -> Option<Element<'_, Message>> {
+        if !self.core.nav_bar_active() {
+            return None;
+        }
+        let nav_model = self.nav_model()?;
+        use cosmic::widget::menu::Item;
+        let items = self
+            .nav_menu_items()
+            .into_iter()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter_map(|entry| match entry {
+                        Item::Button(label, icon, action) => {
+                            Some(Item::Button(label, icon, Place(action)))
+                        }
+                        Item::Divider => Some(Item::Divider),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        let menu = Some(cosmic::widget::menu::nav_context(&HashMap::new(), items));
+        let mut nav = segmented_button::vertical(nav_model)
+            .on_activate(Message::NavPlace)
+            .drag_id(self.nav_drag_id)
+            .on_dnd_enter(|entity, _| Message::DndEnterNav(entity))
+            .on_dnd_leave(|_| Message::DndExitNav)
+            .on_dnd_drop(Message::DndDropNav)
+            .on_context(Message::NavBarContext)
+            .on_close(Message::NavBarClose)
+            .on_middle_press(|entity| {
+                Message::NavMenuAction(NavMenuAction::OpenInNewTab(entity))
+            })
+            .context_menu(menu)
+            .close_icon(icon::from_name("media-eject-symbolic").size(16).icon())
+            .button_height(28)
+            .button_padding([8, 4, 8, 4])
+            .button_spacing(8)
+            .spacing(4)
+            .style(crate::palette::nav_look());
+
+        #[cfg(feature = "wayland")]
+        {
+            nav = nav
+                .window_id_maybe(self.core().main_window_id())
+                .on_surface_action(Message::Surface)
+        }
+
+        let count = nav_model.iter().count();
+        let body = widget::column::with_children([
+            crate::ariadne_ui::header("places", format!("{count:02}")),
+            widget::scrollable(widget::container(nav).padding([8, 8, 8, 8]))
+                .class(cosmic::style::iced::Scrollable::Minimal)
+                .height(Length::Fill)
+                .into(),
+        ]);
+        let panel = widget::container(body)
+            .class(crate::palette::panel())
+            .width(Length::Fixed(232.0))
+            .height(Length::Fill);
+        Some(widget::container(panel).padding([0, 2, 2, 0]).into())
+    }
+
+    /// The context menu entries of every place, for COSMIC's nav bar and the places panel alike.
+    fn nav_menu_items(&self) -> Vec<Vec<widget::menu::Item<NavMenuAction, String>>> {
+        self.nav_model
+            .iter()
+            .map(|entity| {
+                let favorite_index_opt = self.nav_model.data::<FavoriteIndex>(entity);
+                let location_opt = self.nav_model.data::<Location>(entity);
+
+                let mut items: Vec<widget::menu::Item<NavMenuAction, String>> =
+                    Vec::with_capacity(7);
+
+                if location_opt
+                    .and_then(Location::path_opt)
+                    .is_some_and(|x| x.is_file())
+                {
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("open"),
+                        None,
+                        NavMenuAction::Open(entity),
+                    ));
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("menu-open-with"),
+                        None,
+                        NavMenuAction::OpenWith(entity),
+                    ));
+                } else {
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("open-in-new-tab"),
+                        None,
+                        NavMenuAction::OpenInNewTab(entity),
+                    ));
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("open-in-new-window"),
+                        None,
+                        NavMenuAction::OpenInNewWindow(entity),
+                    ));
+                }
+                if let Some(path) = location_opt.and_then(Location::path_opt) {
+                    let selected_dir = usize::from(path.is_dir());
+                    let action_items: Vec<_> = self
+                        .config
+                        .context_actions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, action)| action.matches_selection(1, selected_dir))
+                        .map(|(i, action)| {
+                            cosmic::widget::menu::Item::Button(
+                                action.name.clone(),
+                                None,
+                                NavMenuAction::RunContextAction(entity, i),
+                            )
+                        })
+                        .collect();
+
+                    if !action_items.is_empty() {
+                        items.push(cosmic::widget::menu::Item::Divider);
+                        items.extend(action_items);
+                    }
+                }
+                items.push(cosmic::widget::menu::Item::Divider);
+                if matches!(location_opt, Some(Location::Path(..))) {
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("show-details"),
+                        None,
+                        NavMenuAction::Preview(entity),
+                    ));
+                }
+                items.push(cosmic::widget::menu::Item::Divider);
+                if favorite_index_opt.is_some() {
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("change-sidebar-label"),
+                        None,
+                        NavMenuAction::ChangeSidebarLabel(entity),
+                    ));
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("remove-from-sidebar"),
+                        None,
+                        NavMenuAction::RemoveFromSidebar(entity),
+                    ));
+                }
+
+                if matches!(location_opt, Some(Location::Recents)) && tab::has_recents() {
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("clear-recents-history"),
+                        None,
+                        NavMenuAction::ClearRecents,
+                    ));
+                }
+
+                if matches!(location_opt, Some(Location::Trash)) && !Trash::is_empty() {
+                    items.push(cosmic::widget::menu::Item::Button(
+                        fl!("empty-trash"),
+                        None,
+                        NavMenuAction::EmptyTrash,
+                    ));
+                }
+                items
+            })
+            .collect()
+    }
+
+    /// The strip under the files: what ariadne is doing, then the undo thread, one knot per move.
+    fn ariadne_footer(&self) -> Element<'_, Message> {
+        let ladder = crate::palette::ladder();
+        let typed: String = self.status.line.chars().take(self.status_shown).collect();
+        let typing = self.status_shown < self.status.line.chars().count();
+        let cursor = if typing || self.status.busy { " ▮" } else { "" };
+        let status = widget::text::caption(format!("{typed}{cursor}"))
+            .class(crate::palette::secondary());
+
+        let snapshot = crate::ariadne::snapshot();
+        let shown = snapshot.moves.len().saturating_sub(24);
+        let mut knots = widget::row::with_capacity(24)
+            .spacing(6)
+            .align_y(Alignment::Center);
+        for m in &snapshot.moves[shown..] {
+            let (by_ariadne, learned) = (m.by_ariadne(), m.learned);
+            let look = move |_focused: bool, theme: &theme::Theme| {
+                let mut s = widget::button::Style::new();
+                let (fill, edge) = match ladder {
+                    Some(t) if by_ariadne => (t.accent(), t.accent()),
+                    Some(t) if learned => (t.secondary(), t.text()),
+                    Some(t) => (t.highlight(), t.text()),
+                    None => (
+                        theme.cosmic().accent_color().into(),
+                        theme.cosmic().accent_color().into(),
+                    ),
+                };
+                s.background = Some(cosmic::iced::Background::Color(fill));
+                s.border_width = 1.0;
+                s.border_color = edge;
+                s.border_radius = 0.0.into();
+                s
+            };
+            let knot = widget::button::custom(widget::space::horizontal().width(0))
+                .width(Length::Fixed(10.0))
+                .height(Length::Fixed(10.0))
+                .padding(0)
+                .on_press(Message::KnotCard(Some(m.id)))
+                .class(theme::Button::Custom {
+                    active: Box::new(look),
+                    disabled: Box::new(move |theme| look(false, theme)),
+                    hovered: Box::new(look),
+                    pressed: Box::new(look),
+                });
+            let knot: Element<_> = if self.knot_card == Some(m.id) {
+                use crate::ariadne_ui::{actions, ago, clip, field, name_line, sheet, short};
+                let dest = m.to.parent().unwrap_or(&m.to);
+                let who = if m.by_ariadne() { "ariadne" } else { "you" };
+                let learned = if m.learned { ", learned" } else { "" };
+                let card = sheet(
+                    "moved",
+                    ago(m.at),
+                    vec![
+                        name_line(&m.to),
+                        field("To", clip(&crate::ariadne::folder_name(dest), 24)),
+                        field("Where", clip(&short(dest.parent().unwrap_or(dest)), 24)),
+                        field("By", format!("{who}{learned}")),
+                        actions(vec![
+                            crate::palette::act("Undo")
+                                .on_press(Message::AriadneUndo(Some(m.to.clone())))
+                                .into(),
+                            crate::palette::quiet("Close")
+                                .on_press(Message::KnotCard(None))
+                                .into(),
+                        ]),
+                    ],
+                );
+                widget::popover(knot)
+                    .popup(card)
+                    .on_close(Message::KnotCard(None))
+                    .position(widget::popover::Position::Top)
+                    .into()
+            } else {
+                knot.into()
+            };
+            knots = knots.push(knot);
+        }
+
+        if ladder.is_some() {
+            // The ledger under the footer rail, as the launcher's: the machine's line typed
+            // out on the left, the thread, the keys on the right, all in the instrument register.
+            use crate::yorha::{Tone, micro};
+            let line = if self.status.line.is_empty() {
+                "ready".to_string()
+            } else {
+                format!("{typed}{cursor}")
+            };
+            return widget::row::with_children([
+                micro(&line, Tone::Secondary),
+                widget::space::horizontal().into(),
+                knots.into(),
+                micro(
+                    "up down select   enter open   ctrl+f search   ctrl+3 map   ctrl+z undo",
+                    Tone::Secondary,
+                ),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(24)
+            .padding([4, 16, 8, 16])
+            .into();
+        }
+
+        widget::container(
+            widget::row::with_children([
+                status.width(Length::Fill).into(),
+                knots.into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(16),
+        )
+        .padding([6, 16])
+        .width(Length::Fill)
+        .class(crate::palette::strip())
+        .into()
+    }
+
+    fn rescan_inbox(&mut self) -> Task<Message> {
+        let needs_reload: Box<[_]> = self
+            .tab_model
+            .iter()
+            .filter_map(|entity| {
+                let tab = self.tab_model.data::<Tab>(entity)?;
+                (tab.location == Location::Inbox).then_some(entity)
+            })
+            .collect();
+        Task::batch(
+            needs_reload
+                .into_iter()
+                .map(|entity| self.update_tab(entity, Location::Inbox, None)),
+        )
+    }
+
     fn rescan_recents(&mut self) -> Task<Message> {
         let needs_reload: Box<[_]> = self
             .tab_model
@@ -1684,7 +2225,7 @@ impl App {
         // Tabs are collected first to placate the borrowck
         let tabs: Box<[_]> = self.tab_model.iter().collect();
         // Update main conf and each tab with the new config
-        let commands = std::iter::once(cosmic::command::set_theme(self.config.app_theme.theme()))
+        let commands = std::iter::once(cosmic::command::set_theme(self.config.theme()))
             .chain(tabs.into_iter().map(|entity| {
                 self.update(Message::TabMessage(
                     Some(entity),
@@ -1737,6 +2278,16 @@ impl App {
     fn update_nav_model(&mut self) {
         let mut nav_model = segmented_button::ModelBuilder::default();
 
+        let inbox_text = match self.inbox_count {
+            0 => fl!("inbox"),
+            n => format!("{}  ·  {n}", fl!("inbox")),
+        };
+        nav_model = nav_model.insert(|b| {
+            b.text(inbox_text)
+                .icon(icon::from_name("mail-unread-symbolic"))
+                .data(Location::Inbox)
+        });
+
         if self.config.show_recents {
             nav_model = nav_model.insert(|b| {
                 b.text(fl!("recents"))
@@ -1748,6 +2299,11 @@ impl App {
         for (favorite_i, favorite) in self.config.favorites.iter().enumerate() {
             if let Some(path) = favorite.path_opt() {
                 let name = favorite.display_name().unwrap_or_else(|| fl!("filesystem"));
+                // As the Inbox entry: the files waiting anywhere under this place.
+                let name = match crate::ariadne::snapshot().waiting_in(&path) {
+                    0 => name,
+                    n => format!("{name}  ·  {n}"),
+                };
                 nav_model = nav_model.insert(move |b| {
                     b.text(name.clone())
                         .icon(
@@ -1927,7 +2483,7 @@ impl App {
                     widget::container(if i == 0 {
                         widget::text::heading(part.to_string())
                     } else {
-                        widget::text::body(part.to_string())
+                        crate::palette::body(part.to_string())
                     })
                     .width(Length::Fill)
                     .padding(space_xxs),
@@ -1939,7 +2495,7 @@ impl App {
             }
         }
         widget::column::with_children([
-            widget::text::body(fl!("network-drive-description")).into(),
+            crate::palette::body(fl!("network-drive-description")).into(),
             table.into(),
         ])
         .spacing(space_m)
@@ -2048,7 +2604,7 @@ impl App {
                                 ))
                                 .on_press(Message::PendingPause(*id, false))
                                 .padding(8),
-                                widget::text::body(fl!("resume")),
+                                crate::palette::body(fl!("resume")),
                                 widget::tooltip::Position::Top,
                             )
                             .into()
@@ -2059,7 +2615,7 @@ impl App {
                                 ))
                                 .on_press(Message::PendingPause(*id, true))
                                 .padding(8),
-                                widget::text::body(fl!("pause")),
+                                crate::palette::body(fl!("pause")),
                                 widget::tooltip::Position::Top,
                             )
                             .into()
@@ -2068,14 +2624,14 @@ impl App {
                             widget::button::icon(icon::from_name("window-close-symbolic"))
                                 .on_press(Message::PendingCancel(*id))
                                 .padding(8),
-                            widget::text::body(fl!("cancel")),
+                            crate::palette::body(fl!("cancel")),
                             widget::tooltip::Position::Top,
                         )
                         .into(),
                     ])
                     .align_y(Alignment::Center)
                     .into(),
-                    widget::text::body(op.pending_text(progress, controller.state())).into(),
+                    crate::palette::body(op.pending_text(progress, controller.state())).into(),
                 ]));
             }
             children.push(section.into());
@@ -2086,8 +2642,8 @@ impl App {
             for (op, controller, error) in self.failed_operations.values().rev() {
                 let progress = controller.progress();
                 section = section.add(widget::column::with_children([
-                    widget::text::body(op.pending_text(progress, controller.state())).into(),
-                    widget::text::body(error).into(),
+                    crate::palette::body(op.pending_text(progress, controller.state())).into(),
+                    crate::palette::body(error).into(),
                 ]));
             }
             children.push(section.into());
@@ -2096,13 +2652,13 @@ impl App {
         if !self.complete_operations.is_empty() {
             let mut section = widget::settings::section().title(fl!("complete"));
             for op in self.complete_operations.values().rev() {
-                section = section.add(widget::text::body(op.completed_text()));
+                section = section.add(crate::palette::body(op.completed_text()));
             }
             children.push(section.into());
         }
 
         if children.is_empty() {
-            children.push(widget::text::body(fl!("no-history")).into());
+            children.push(crate::palette::body(fl!("no-history")).into());
         }
 
         widget::column::with_children(children)
@@ -2184,15 +2740,23 @@ impl App {
 
     fn settings(&self) -> Element<'_, Message> {
         let tab_config = self.config.tab;
+        // Under the palette a section opens with the micro caps label and its rule, as the
+        // Tidy list's do; COSMIC's titles are bold, and the law has no bold.
+        fn titled<'a>(section: settings::Section<'a, Message>, title: String) -> Vec<Element<'a, Message>> {
+            if crate::palette::ladder().is_some() {
+                vec![crate::ariadne_ui::section(&title), section.into()]
+            } else {
+                vec![section.title(title).into()]
+            }
+        }
 
         // TODO: Should dialog be updated here too?
-        settings::view_column(vec![
-            settings::section()
-                .title(fl!("appearance"))
+        let appearance = settings::section()
                 .add({
                     let app_theme_selected = match self.config.app_theme {
                         AppTheme::Dark => 1,
                         AppTheme::Light => 2,
+                        AppTheme::Palette => 3,
                         AppTheme::System => 0,
                     };
                     settings::item::builder(fl!("theme")).control(widget::dropdown(
@@ -2202,14 +2766,45 @@ impl App {
                             Message::AppTheme(match index {
                                 1 => AppTheme::Dark,
                                 2 => AppTheme::Light,
+                                3 => AppTheme::Palette,
                                 _ => AppTheme::System,
                             })
                         },
                     ))
                 })
-                .into(),
-            settings::section()
-                .title(fl!("type-to-search"))
+                .add(
+                    settings::item::builder(fl!("palette-file")).control(
+                        widget::text_input("", self.palette_input.as_str())
+                            .on_input(Message::PaletteInput)
+                            .on_submit(|_| Message::PaletteSubmit)
+                            .width(Length::Fixed(280.0)),
+                    ),
+                )
+                .add(
+                    settings::item::builder(fl!("font")).control(
+                        widget::text_input("", self.font_input.as_str())
+                            .on_input(Message::FontInput)
+                            .on_submit(|_| Message::FontSubmit)
+                            .width(Length::Fixed(280.0)),
+                    ),
+                )
+                .add(
+                    settings::item::builder(fl!("icons")).control(
+                        widget::text_input("", self.icons_input.as_str())
+                            .on_input(Message::IconsInput)
+                            .on_submit(|_| Message::IconsSubmit)
+                            .width(Length::Fixed(280.0)),
+                    ),
+                )
+                .add(
+                    settings::item::builder(fl!("motion"))
+                        .toggler(self.config.motion, Message::SetMotion),
+                )
+                .add(
+                    settings::item::builder(fl!("sound"))
+                        .toggler(self.config.sound, Message::SetSound),
+                );
+        let type_to_search = settings::section()
                 .add(
                     settings::item::builder(fl!("type-to-search-recursive")).radio(
                         TypeToSearch::Recursive,
@@ -2228,10 +2823,8 @@ impl App {
                     TypeToSearch::SelectByPrefix,
                     Some(self.config.type_to_search),
                     Message::SetTypeToSearch,
-                ))
-                .into(),
-            settings::section()
-                .title(fl!("other"))
+                ));
+        let other = settings::section()
                 .add({
                     settings::item::builder(fl!("single-click")).toggler(
                         tab_config.single_click,
@@ -2246,10 +2839,11 @@ impl App {
                 .add({
                     settings::item::builder(fl!("show-recents"))
                         .toggler(self.config.show_recents, Message::SetShowRecents)
-                })
-                .into(),
-        ])
-        .into()
+                });
+        let mut column = titled(appearance, fl!("appearance"));
+        column.extend(titled(type_to_search, fl!("type-to-search")));
+        column.extend(titled(other, fl!("other")));
+        settings::view_column(column).into()
     }
 
     // Update favorites based on renaming or moving dirs.
@@ -2356,7 +2950,7 @@ impl Application for App {
             }
         }
 
-        let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
+        let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light"), fl!("palette")];
 
         let key_binds = key_binds(&match flags.mode {
             Mode::App => tab::Mode::App,
@@ -2399,6 +2993,8 @@ impl Application for App {
         if matches!(flags.mode, Mode::Desktop) {
             core.set_auto_blur(Auto::Window | Auto::Popup);
         }
+        let palette_input = flags.config.palette.to_string_lossy().to_string();
+        let (font_input, icons_input) = (flags.config.font.clone(), flags.config.icons.clone());
         let mut app = Self {
             core,
             about,
@@ -2443,6 +3039,14 @@ impl Application for App {
             watcher_opt: None,
             windows: FxHashMap::default(),
             nav_dnd_hover: None,
+            inbox_count: 0,
+            palette_input,
+            font_input,
+            icons_input,
+            status: crate::ariadne::Activity::default(),
+            status_shown: 0,
+            knot_card: None,
+            tidy_names: HashMap::new(),
             tab_dnd_hover: None,
             type_select_prefix: String::new(),
             type_select_last_key: None,
@@ -2499,6 +3103,11 @@ impl Application for App {
             return None;
         }
 
+        // Under the palette theme the places live inside the view, under the same texture.
+        if crate::palette::ladder().is_some() {
+            return None;
+        }
+
         let nav_model = self.nav_model()?;
 
         let mut nav = cosmic::widget::nav_bar(nav_model, |entity| {
@@ -2537,103 +3146,9 @@ impl Application for App {
     }
 
     fn nav_context_menu(&self) -> Option<Vec<widget::menu::Tree<cosmic::Action<Self::Message>>>> {
-        let items = self.nav_model.iter().map(|entity| {
-            let favorite_index_opt = self.nav_model.data::<FavoriteIndex>(entity);
-            let location_opt = self.nav_model.data::<Location>(entity);
-
-            let mut items: Vec<widget::menu::Item<NavMenuAction, String>> = Vec::with_capacity(7);
-
-            if location_opt
-                .and_then(Location::path_opt)
-                .is_some_and(|x| x.is_file())
-            {
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("open"),
-                    None,
-                    NavMenuAction::Open(entity),
-                ));
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("menu-open-with"),
-                    None,
-                    NavMenuAction::OpenWith(entity),
-                ));
-            } else {
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("open-in-new-tab"),
-                    None,
-                    NavMenuAction::OpenInNewTab(entity),
-                ));
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("open-in-new-window"),
-                    None,
-                    NavMenuAction::OpenInNewWindow(entity),
-                ));
-            }
-            if let Some(path) = location_opt.and_then(Location::path_opt) {
-                let selected_dir = usize::from(path.is_dir());
-                let action_items: Vec<_> = self
-                    .config
-                    .context_actions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, action)| action.matches_selection(1, selected_dir))
-                    .map(|(i, action)| {
-                        cosmic::widget::menu::Item::Button(
-                            action.name.clone(),
-                            None,
-                            NavMenuAction::RunContextAction(entity, i),
-                        )
-                    })
-                    .collect();
-
-                if !action_items.is_empty() {
-                    items.push(cosmic::widget::menu::Item::Divider);
-                    items.extend(action_items);
-                }
-            }
-            items.push(cosmic::widget::menu::Item::Divider);
-            if matches!(location_opt, Some(Location::Path(..))) {
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("show-details"),
-                    None,
-                    NavMenuAction::Preview(entity),
-                ));
-            }
-            items.push(cosmic::widget::menu::Item::Divider);
-            if favorite_index_opt.is_some() {
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("change-sidebar-label"),
-                    None,
-                    NavMenuAction::ChangeSidebarLabel(entity),
-                ));
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("remove-from-sidebar"),
-                    None,
-                    NavMenuAction::RemoveFromSidebar(entity),
-                ));
-            }
-
-            if matches!(location_opt, Some(Location::Recents)) && tab::has_recents() {
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("clear-recents-history"),
-                    None,
-                    NavMenuAction::ClearRecents,
-                ));
-            }
-
-            if matches!(location_opt, Some(Location::Trash)) && !Trash::is_empty() {
-                items.push(cosmic::widget::menu::Item::Button(
-                    fl!("empty-trash"),
-                    None,
-                    NavMenuAction::EmptyTrash,
-                ));
-            }
-            items
-        });
-
         Some(cosmic::widget::menu::nav_context(
             &HashMap::new(),
-            items.collect(),
+            self.nav_menu_items(),
         ))
     }
 
@@ -3798,6 +4313,19 @@ impl Application for App {
                         .map(|parent| self.open_tab(Location::Path(parent), true, Some(vec![path])))
                 }));
             }
+            Message::FindSimilar(entity_opt) => {
+                let selected_paths: Box<[_]> = self.selected_paths(entity_opt).collect();
+                return Task::batch(selected_paths.into_iter().filter_map(|path| {
+                    let parent = path.parent()?.to_path_buf();
+                    let location = Location::Search(
+                        SearchLocation::Path(parent),
+                        format!("like:{}", path.display()),
+                        false,
+                        Instant::now(),
+                    );
+                    Some(self.open_tab(location, true, None))
+                }));
+            }
             Message::OpenWithBrowse => match self.dialog_pages.pop_front() {
                 Some((
                     DialogPage::OpenWith {
@@ -4228,6 +4756,13 @@ impl Application for App {
             Message::RescanRecents => {
                 return self.rescan_recents();
             }
+            Message::InboxChanged(count) => {
+                if count != self.inbox_count {
+                    self.inbox_count = count;
+                    self.update_nav_model();
+                }
+                return self.rescan_inbox();
+            }
             Message::RescanTrash => {
                 // Update trash icon if empty/full
                 let maybe_entity = self.nav_model.iter().find(|&entity| {
@@ -4354,6 +4889,126 @@ impl Application for App {
             Message::SetShowRecents(show_recents) => {
                 config_set!(show_recents, show_recents);
                 return self.update_config();
+            }
+            Message::SetMotion(motion) => {
+                config_set!(motion, motion);
+                return self.update_config();
+            }
+            Message::SetSound(sound) => {
+                config_set!(sound, sound);
+                return self.update_config();
+            }
+            Message::PaletteInput(input) => {
+                self.palette_input = input;
+            }
+            Message::PaletteSubmit => {
+                let path = crate::palette::expand(self.palette_input.trim());
+                config_set!(palette, path);
+                return self.update_config();
+            }
+            Message::FontInput(input) => {
+                self.font_input = input;
+            }
+            Message::FontSubmit => {
+                config_set!(font, self.font_input.trim().to_string());
+                return self.update_config();
+            }
+            Message::IconsInput(input) => {
+                self.icons_input = input;
+            }
+            Message::IconsSubmit => {
+                config_set!(icons, self.icons_input.trim().to_string());
+                return self.update_config();
+            }
+            Message::AriadneChanged => {
+                // New moves travel across any open map.
+                let tabs: Box<[_]> = self.tab_model.iter().collect();
+                return Task::batch(tabs.into_iter().map(|entity| {
+                    self.update(Message::TabMessage(Some(entity), tab::Message::MapMoves))
+                }));
+            }
+            Message::MapFrame(now) => {
+                let tabs: Box<[_]> = self
+                    .tab_model
+                    .iter()
+                    .filter(|&e| self.tab_model.data::<Tab>(e).is_some_and(Tab::map_animating))
+                    .collect();
+                return Task::batch(tabs.into_iter().map(|entity| {
+                    self.update(Message::TabMessage(Some(entity), tab::Message::MapTick(now)))
+                }));
+            }
+            Message::TidyApply(id) => {
+                let name = self.tidy_name(&id);
+                if !crate::ariadne::apply(&id, name.as_deref()) {
+                    log::warn!("ariadne: applying {id} failed");
+                }
+                self.refresh_ariadne();
+            }
+            Message::TidySkip(id) => {
+                crate::ariadne::skip(&id);
+                self.refresh_ariadne();
+            }
+            Message::TidyAll => {
+                for p in crate::ariadne::snapshot().proposals.iter() {
+                    let name = self.tidy_name(&p.id);
+                    if !crate::ariadne::apply(&p.id, name.as_deref()) {
+                        log::warn!("ariadne: applying {} failed", p.id);
+                    }
+                }
+                self.refresh_ariadne();
+            }
+            Message::TidyName(id, name) => {
+                self.tidy_names.insert(id, name);
+            }
+            Message::AriadneActivity(activity) => {
+                if activity != self.status {
+                    self.status_shown = if self.config.motion {
+                        0
+                    } else {
+                        activity.line.chars().count()
+                    };
+                    self.status = activity;
+                }
+            }
+            Message::StatusTick => {
+                if self.status_shown < self.status.line.chars().count() {
+                    self.status_shown += 1;
+                }
+            }
+            Message::FlashTick => {}
+            Message::KnotCard(id) => {
+                self.knot_card = id;
+                // On the map, a knot shows its move's route again.
+                let entity = self.tab_model.active();
+                if self.tab_model.data::<Tab>(entity).is_some_and(Tab::map_open)
+                    && let Some(m) = crate::ariadne::snapshot()
+                        .moves
+                        .iter()
+                        .find(|m| Some(m.id) == id)
+                {
+                    let from = m.from.parent().map(Path::to_path_buf).unwrap_or_default();
+                    return self.update(Message::TabMessage(
+                        Some(entity),
+                        tab::Message::MapReplay(from, m.to.clone()),
+                    ));
+                }
+            }
+            Message::AriadneUndo(path) => {
+                self.knot_card = None;
+                let done = match &path {
+                    Some(path) => crate::ariadne::act(crate::ariadne::InboxVerb::Undo, path),
+                    None => crate::ariadne::undo_last(),
+                };
+                let note = if done { "Undone" } else { "Nothing to undo" };
+                return self
+                    .toasts
+                    .push(widget::toaster::Toast::new(note))
+                    .map(cosmic::Action::App);
+            }
+            Message::PaletteChanged => {
+                if self.config.app_theme == AppTheme::Palette {
+                    return cosmic::command::set_theme(self.config.theme());
+                }
             }
             Message::SetTypeToSearch(type_to_search) => {
                 config_set!(type_to_search, type_to_search);
@@ -4838,7 +5493,7 @@ impl Application for App {
                         Some(Location::Trash | Location::Search(SearchLocation::Trash, ..)) => {
                             command.arg("--trash");
                         }
-                        None => {}
+                        Some(Location::Inbox) | None => {}
                     };
 
                     // spawn the new window
@@ -5007,6 +5662,9 @@ impl Application for App {
                     // Close location editing if enabled
                     tab.edit_location = None;
                 }
+            }
+            Message::NavPlace(entity) => {
+                return self.on_nav_select(entity);
             }
             Message::NavMenuAction(action) => match action {
                 NavMenuAction::ClearRecents => match recently_used_xbel::clear_recently_used() {
@@ -5404,6 +6062,12 @@ impl Application for App {
         if !self.core.window.show_context {
             return None;
         }
+        // Under the palette Tidy and Settings are panels of the sheet, not drawers.
+        if matches!(self.context_page, ContextPage::Tidy | ContextPage::Settings)
+            && crate::palette::ladder().is_some()
+        {
+            return None;
+        }
 
         Some(match &self.context_page {
             ContextPage::About => context_drawer::about(
@@ -5469,6 +6133,24 @@ impl Application for App {
                 Message::ToggleContextPage(ContextPage::Settings),
             )
             .title(fl!("settings")),
+            ContextPage::Tidy => {
+                let n = crate::ariadne::snapshot().proposals.len();
+                let mut drawer = context_drawer::context_drawer(
+                    self.tidy(),
+                    Message::ToggleContextPage(ContextPage::Tidy),
+                )
+                .title(if n > 0 {
+                    format!("{n} changes")
+                } else {
+                    fl!("tidy-empty")
+                });
+                if n > 1 {
+                    drawer = drawer.header(
+                        crate::palette::act(fl!("tidy-all")).on_press(Message::TidyAll),
+                    );
+                }
+                drawer
+            }
         })
     }
 
@@ -5502,13 +6184,13 @@ impl Application for App {
                 let complete_maybe = if name.is_empty() {
                     None
                 } else if name == "." || name == ".." {
-                    dialog = dialog.tertiary_action(widget::text::body(fl!(
+                    dialog = dialog.tertiary_action(crate::palette::body(fl!(
                         "name-invalid",
                         filename = name.as_str()
                     )));
                     None
                 } else if name.contains('/') {
-                    dialog = dialog.tertiary_action(widget::text::body(fl!("name-no-slashes")));
+                    dialog = dialog.tertiary_action(crate::palette::body(fl!("name-no-slashes")));
                     None
                 } else {
                     let extension = archive_type.extension();
@@ -5516,11 +6198,11 @@ impl Application for App {
                     let path = to.join(&name);
                     if path.exists() {
                         dialog =
-                            dialog.tertiary_action(widget::text::body(fl!("file-already-exists")));
+                            dialog.tertiary_action(crate::palette::body(fl!("file-already-exists")));
                         None
                     } else {
                         if name.starts_with('.') {
-                            dialog = dialog.tertiary_action(widget::text::body(fl!("name-hidden")));
+                            dialog = dialog.tertiary_action(crate::palette::body(fl!("name-hidden")));
                         }
                         Some(Message::DialogComplete)
                     }
@@ -5538,7 +6220,7 @@ impl Application for App {
                     )
                     .control(
                         widget::column::with_children([
-                            widget::text::body(fl!("file-name")).into(),
+                            crate::palette::body(fl!("file-name")).into(),
                             widget::row::with_children([
                                 widget::text_input("", name.as_str())
                                     .id(self.dialog_text_input.clone())
@@ -5580,7 +6262,7 @@ impl Application for App {
                 if *archive_type == ArchiveType::Zip {
                     let password_unwrapped = password.clone().unwrap_or_default();
                     dialog = dialog.control(widget::column::with_children([
-                        widget::text::body(fl!("password")).into(),
+                        crate::palette::body(fl!("password")).into(),
                         widget::text_input("", password_unwrapped)
                             .password()
                             .on_input(move |password_unwrapped| {
@@ -5831,28 +6513,28 @@ impl Application for App {
                 let complete_maybe = if name.is_empty() {
                     None
                 } else if name == "." || name == ".." {
-                    dialog = dialog.tertiary_action(widget::text::body(fl!(
+                    dialog = dialog.tertiary_action(crate::palette::body(fl!(
                         "name-invalid",
                         filename = name.as_str()
                     )));
                     None
                 } else if name.contains('/') {
-                    dialog = dialog.tertiary_action(widget::text::body(fl!("name-no-slashes")));
+                    dialog = dialog.tertiary_action(crate::palette::body(fl!("name-no-slashes")));
                     None
                 } else {
                     let path = parent.join(name);
                     if path.exists() {
                         if path.is_dir() {
                             dialog = dialog
-                                .tertiary_action(widget::text::body(fl!("folder-already-exists")));
+                                .tertiary_action(crate::palette::body(fl!("folder-already-exists")));
                         } else {
                             dialog = dialog
-                                .tertiary_action(widget::text::body(fl!("file-already-exists")));
+                                .tertiary_action(crate::palette::body(fl!("file-already-exists")));
                         }
                         None
                     } else {
                         if name.starts_with('.') {
-                            dialog = dialog.tertiary_action(widget::text::body(fl!("name-hidden")));
+                            dialog = dialog.tertiary_action(crate::palette::body(fl!("name-hidden")));
                         }
                         Some(Message::DialogComplete)
                     }
@@ -5868,7 +6550,7 @@ impl Application for App {
                     )
                     .control(
                         widget::column::with_children([
-                            widget::text::body(if *dir {
+                            crate::palette::body(if *dir {
                                 fl!("folder-name")
                             } else {
                                 fl!("file-name")
@@ -5953,13 +6635,13 @@ impl Application for App {
                                     icon(app.icon()).size(32).into(),
                                     if app.is_default(mime) && !displayed_default {
                                         displayed_default = true;
-                                        widget::text::body(fl!(
+                                        crate::palette::body(fl!(
                                             "default-app",
                                             name = Some(app.name.as_str())
                                         ))
                                         .into()
                                     } else {
-                                        widget::text::body(app.name.clone()).into()
+                                        crate::palette::body(app.name.clone()).into()
                                     },
                                     widget::space::horizontal().into(),
                                     if *selected == i {
@@ -6104,7 +6786,7 @@ impl Application for App {
                     )
                     .control(
                         widget::column::with_children([
-                            widget::text::body(fl!("sidebar-label")).into(),
+                            crate::palette::body(fl!("sidebar-label")).into(),
                             widget::text_input("", label.as_str())
                                 .id(self.dialog_text_input.clone())
                                 .on_input(move |label| {
@@ -6135,28 +6817,28 @@ impl Application for App {
                 let complete_maybe = if name.is_empty() {
                     None
                 } else if name == "." || name == ".." {
-                    dialog = dialog.tertiary_action(widget::text::body(fl!(
+                    dialog = dialog.tertiary_action(crate::palette::body(fl!(
                         "name-invalid",
                         filename = name.as_str()
                     )));
                     None
                 } else if name.contains('/') {
-                    dialog = dialog.tertiary_action(widget::text::body(fl!("name-no-slashes")));
+                    dialog = dialog.tertiary_action(crate::palette::body(fl!("name-no-slashes")));
                     None
                 } else {
                     let path = parent.join(name);
                     if *from != path && path.exists() {
                         if path.is_dir() {
                             dialog = dialog
-                                .tertiary_action(widget::text::body(fl!("folder-already-exists")));
+                                .tertiary_action(crate::palette::body(fl!("folder-already-exists")));
                         } else {
                             dialog = dialog
-                                .tertiary_action(widget::text::body(fl!("file-already-exists")));
+                                .tertiary_action(crate::palette::body(fl!("file-already-exists")));
                         }
                         None
                     } else {
                         if name.starts_with('.') {
-                            dialog = dialog.tertiary_action(widget::text::body(fl!("name-hidden")));
+                            dialog = dialog.tertiary_action(crate::palette::body(fl!("name-hidden")));
                         }
                         Some(Message::DialogComplete)
                     }
@@ -6172,7 +6854,7 @@ impl Application for App {
                     )
                     .control(
                         widget::column::with_children([
-                            widget::text::body(if *dir {
+                            crate::palette::body(if *dir {
                                 fl!("folder-name")
                             } else {
                                 fl!("file-name")
@@ -6368,7 +7050,7 @@ impl Application for App {
                         widget::button::icon(icon::from_name("media-playback-start-symbolic"))
                             .on_press(Message::PendingPauseAll(false))
                             .padding(8),
-                        widget::text::body(fl!("resume")),
+                        crate::palette::body(fl!("resume")),
                         widget::tooltip::Position::Top,
                     )
                     .into()
@@ -6377,7 +7059,7 @@ impl Application for App {
                         widget::button::icon(icon::from_name("media-playback-pause-symbolic"))
                             .on_press(Message::PendingPauseAll(true))
                             .padding(8),
-                        widget::text::body(fl!("pause")),
+                        crate::palette::body(fl!("pause")),
                         widget::tooltip::Position::Top,
                     )
                     .into()
@@ -6386,14 +7068,14 @@ impl Application for App {
                     widget::button::icon(icon::from_name("window-close-symbolic"))
                         .on_press(Message::PendingCancelAll)
                         .padding(8),
-                    widget::text::body(fl!("cancel")),
+                    crate::palette::body(fl!("cancel")),
                     widget::tooltip::Position::Top,
                 )
                 .into(),
             ])
             .align_y(Alignment::Center)
             .into(),
-            widget::text::body(title).into(),
+            crate::palette::body(title).into(),
             widget::space::vertical().height(space_s).into(),
             widget::row::with_children([
                 widget::button::link(fl!("details"))
@@ -6427,28 +7109,33 @@ impl Application for App {
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
-        let mut elements = Vec::with_capacity(2);
+        let mut elements = Vec::with_capacity(3);
 
-        if let Some(term) = self.search_get() {
-            if self.core.is_condensed() {
-                elements.push(
-                    //TODO: selected state is not appearing different
-                    widget::button::icon(icon::from_name("system-search-symbolic"))
-                        .on_press(Message::SearchClear)
-                        .padding(8)
-                        .selected(true)
-                        .into(),
-                );
+        // Tidy: the count of changes ariadne would make; opens the list of them.
+        let ideas = crate::ariadne::snapshot().proposals.len();
+        if ideas > 0 {
+            let label = format!("{}  {ideas}", fl!("tidy"));
+            elements.push(if crate::palette::ladder().is_some() {
+                crate::palette::act(label.to_uppercase())
+                    .on_press(Message::ToggleContextPage(ContextPage::Tidy))
+                    .into()
             } else {
-                elements.push(
-                    widget::text_input::search_input("", term)
-                        .width(Length::Fixed(240.0))
-                        .id(self.search_id.clone())
-                        .on_clear(Message::SearchClear)
-                        .on_input(Message::SearchInput)
-                        .into(),
-                );
-            }
+                widget::button::text(label)
+                    .on_press(Message::ToggleContextPage(ContextPage::Tidy))
+                    .into()
+            });
+        }
+
+        // Search is a full-width bar under the header (see view): queries are sentences now.
+        if self.search_get().is_some() {
+            elements.push(
+                //TODO: selected state is not appearing different
+                widget::button::icon(icon::from_name("system-search-symbolic"))
+                    .on_press(Message::SearchClear)
+                    .padding(8)
+                    .selected(true)
+                    .into(),
+            );
         } else {
             elements.push(
                 widget::button::icon(icon::from_name("system-search-symbolic"))
@@ -6466,15 +7153,22 @@ impl Application for App {
         let cosmic_theme::Spacing {
             space_xxs, space_s, ..
         } = theme::spacing();
+        // Folder tiles count Tidy ideas only while the Tidy list is open; any page beside the
+        // items takes the detail panel's place.
+        crate::ariadne::set_tidy_open(
+            self.core.window.show_context && self.context_page == ContextPage::Tidy,
+        );
+        crate::ariadne::set_side_open(
+            self.core.window.show_context
+                && matches!(self.context_page, ContextPage::Tidy | ContextPage::Settings),
+        );
 
         let mut tab_column = widget::column::with_capacity(4);
 
-        if self.core.is_condensed()
-            && let Some(term) = self.search_get()
-        {
+        if let Some(term) = self.search_get() {
             tab_column = tab_column.push(
                 widget::container(
-                    widget::text_input::search_input("", term)
+                    widget::text_input::search_input(fl!("search-placeholder"), term)
                         .width(Length::Fill)
                         .id(self.search_id.clone())
                         .on_clear(Message::SearchClear)
@@ -6518,12 +7212,35 @@ impl Application for App {
                 )
                 .map(move |message| Message::TabMessage(Some(entity), message));
             tab_column = tab_column.push(tab_view);
+            if crate::palette::ladder().is_none() {
+                tab_column = tab_column.push(self.ariadne_footer());
+            }
         } else {
             //TODO
         }
 
         // The toaster is added on top of an empty element to ensure that it does not override context menus
         tab_column = tab_column.push(widget::toaster(&self.toasts, widget::space::horizontal()));
+
+        if crate::palette::ladder().is_some() {
+            // The launcher's sheet: a rail under the header, places and the tab side by side,
+            // a rail over the ledger, the grid over everything. No ground ornament: only thin
+            // gutters of field show, and under MSAA iced_wgpu paints a lower stack layer over
+            // the panels above it.
+            let body = widget::row::with_capacity(3)
+                .push_maybe(self.places())
+                .push(tab_column)
+                .push_maybe(self.side_page())
+                .spacing(6)
+                .height(Length::Fill);
+            let sheet = widget::column::with_children([
+                crate::yorha::dot_rail(true),
+                widget::container(body).padding([6, 8, 0, 8]).into(),
+                crate::yorha::dot_rail(false),
+                self.ariadne_footer(),
+            ]);
+            return cosmic::iced::widget::stack![sheet, crate::yorha::grid_texture()].into();
+        }
 
         let content: Element<_> = tab_column.into();
 
@@ -6628,8 +7345,86 @@ impl Application for App {
             not(target_os = "android")
         ))]
         struct RecentsWatcherSubscription;
+        struct InboxSubscription;
+        struct PaletteSubscription;
 
+        struct ActivitySubscription;
+
+        let palette = self.config.palette.clone();
         let mut subscriptions = vec![
+            // The status line: ask the daemon what it is doing, once a second.
+            Subscription::run_with(TypeId::of::<ActivitySubscription>(), |_| {
+                stream::channel(1, |mut output: futures::channel::mpsc::Sender<Message>| async move {
+                    loop {
+                        let activity = tokio::task::spawn_blocking(|| {
+                            std::thread::sleep(time::Duration::from_secs(1));
+                            crate::ariadne::activity()
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                        if output.send(Message::AriadneActivity(activity)).await.is_err() {
+                            break;
+                        }
+                    }
+                    std::future::pending().await
+                })
+            }),
+            // Follow edits to the palette file: rebuild the theme when its mtime moves.
+            Subscription::run_with((TypeId::of::<PaletteSubscription>(), palette), |(_, path)| {
+                let path = path.clone();
+                stream::channel(1, |mut output: futures::channel::mpsc::Sender<Message>| async move {
+                    let mut last = crate::palette::stamp(&path);
+                    loop {
+                        tokio::time::sleep(time::Duration::from_secs(1)).await;
+                        let now = crate::palette::stamp(&path);
+                        if now != last {
+                            last = now;
+                            if output.send(Message::PaletteChanged).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    std::future::pending().await
+                })
+            }),
+            // ariadne's Inbox: poll the daemon's change counter, reload when it moves.
+            Subscription::run_with(TypeId::of::<InboxSubscription>(), |_| {
+                stream::channel(
+                    1,
+                    |mut output: futures::channel::mpsc::Sender<Message>| async move {
+                        let mut last = None;
+                        loop {
+                            let version = tokio::task::spawn_blocking(|| {
+                                std::thread::sleep(time::Duration::from_secs(2));
+                                crate::ariadne::inbox_version()
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if version == last {
+                                continue;
+                            }
+                            last = version;
+                            let waiting = tokio::task::spawn_blocking(|| {
+                                let snapshot = crate::ariadne::fetch().unwrap_or_default();
+                                let waiting = snapshot.waiting();
+                                crate::ariadne::set_snapshot(std::sync::Arc::new(snapshot));
+                                waiting
+                            })
+                            .await
+                            .unwrap_or(0);
+                            if output.send(Message::AriadneChanged).await.is_err()
+                                || output.send(Message::InboxChanged(waiting)).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        std::future::pending().await
+                    },
+                )
+            }),
             //TODO: filter more events by window id
             event::listen_with(|event, status, window_id| match event {
                 Event::Mouse(mouse::Event::ButtonPressed(button)) => match status {
@@ -6932,6 +7727,31 @@ impl Application for App {
                 )
             }),
         ];
+
+        // Maps get frames only while something on them moves.
+        if self
+            .tab_model
+            .iter()
+            .any(|e| self.tab_model.data::<Tab>(e).is_some_and(Tab::map_animating))
+        {
+            subscriptions.push(window::frames().map(|(_, now)| Message::MapFrame(now)));
+        }
+
+        // The cursor's flash has three discrete steps; a tick a step's eighth keeps them on time.
+        if self
+            .tab_model
+            .iter()
+            .any(|e| self.tab_model.data::<Tab>(e).is_some_and(Tab::flashing))
+        {
+            subscriptions
+                .push(iced::time::every(time::Duration::from_millis(50)).map(|_| Message::FlashTick));
+        }
+
+        // The status line types itself out, 18 ms a character, then stops ticking.
+        if self.status_shown < self.status.line.chars().count() {
+            subscriptions
+                .push(iced::time::every(time::Duration::from_millis(18)).map(|_| Message::StatusTick));
+        }
 
         if let Some(scroll_speed) = self.auto_scroll_speed {
             subscriptions.push(

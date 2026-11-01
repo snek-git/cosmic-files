@@ -833,7 +833,11 @@ impl App {
         let config = self.flags.config.dialog_tab();
         self.tab.config.view = config.view;
         self.update_nav_model();
-        self.update(Message::TabMessage(tab::Message::Config(config)))
+        // The picker wears the file manager's theme, palette included.
+        Task::batch([
+            cosmic::command::set_theme(self.flags.config.theme()),
+            self.update(Message::TabMessage(tab::Message::Config(config))),
+        ])
     }
 
     fn with_dialog_config<F: Fn(&mut DialogConfig)>(&mut self, f: F) -> Task<Message> {

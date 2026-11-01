@@ -54,6 +54,7 @@ pub fn key_binds(mode: &tab::Mode) -> HashMap<KeyBind, Action> {
     // Switch view
     bind!([Ctrl], Key::Character("1".into()), TabViewList);
     bind!([Ctrl], Key::Character("2".into()), TabViewGrid);
+    bind!([Ctrl], Key::Character("3".into()), TabViewMap);
 
     // App-only keys
     if matches!(mode, tab::Mode::App) {
@@ -73,6 +74,9 @@ pub fn key_binds(mode: &tab::Mode) -> HashMap<KeyBind, Action> {
         bind!([Ctrl], Key::Character("c".into()), Copy);
         bind!([Ctrl, Shift], Key::Character("c".into()), CopyPath);
         bind!([Ctrl], Key::Character("x".into()), Cut);
+        bind!([Ctrl], Key::Character("z".into()), AriadneUndo);
+        // a plain N would steal the letter from type-to-search
+        bind!([Alt], Key::Character("n".into()), AriadneNext);
         bind!([], Key::Named(Named::Delete), Delete);
         bind!([Shift], Key::Named(Named::Delete), PermanentlyDelete);
         bind!([Shift], Key::Named(Named::Enter), OpenInNewWindow);

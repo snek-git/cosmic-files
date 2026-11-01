@@ -76,6 +76,97 @@ const MAX_SEARCH_LATENCY: Duration = Duration::from_millis(20);
 const MAX_SEARCH_RESULTS: usize = 200;
 //TODO: configurable thumbnail size?
 const THUMBNAIL_SIZE: u32 = (ICON_SIZE_GRID as u32) * (ICON_SCALE_MAX as u32);
+/// The detail panel beside the items under the palette theme.
+const DETAIL_WIDTH: f32 = 360.0;
+
+/// A date or size cell in list view: secondary ink, and the 12px body of the palette theme, on
+/// one line.
+fn cell<'a>(text: String, selected: bool) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    // on the selection the cell takes the row's light ink, as the name does
+    let t = crate::palette::body(text);
+    let t = if selected { t } else { t.class(crate::palette::secondary()) };
+    if crate::palette::ladder().is_some() {
+        t.size(12.0).wrapping(text::Wrapping::None)
+    } else {
+        t
+    }
+}
+
+/// The first lines of a text file set as a page in the detail panel's matte. Only as many lines
+/// as fit are read out of the editor.
+fn text_page<'a>(content: &widget::text_editor::Content, size: f32) -> Element<'a, Message> {
+    let px = (size / 18.0).clamp(4.0, 11.0);
+    let rows = (size / (px * 1.3)) as usize;
+    let cols = (size / (px * 0.6)) as usize;
+    let head = content
+        .lines()
+        .take(rows)
+        .map(|line| line.text.replace('\t', "    ").chars().take(cols).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ink = match crate::palette::ladder() {
+        Some(t) => theme::Text::Color(t.text()),
+        None => theme::Text::Default,
+    };
+    crate::ariadne_ui::matte(
+        widget::container(
+            widget::text(head)
+                .size(px)
+                .font(font::mono())
+                .wrapping(text::Wrapping::None)
+                .class(ink),
+        )
+        .padding(size / 14.0)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .clip(true)
+        .into(),
+        size,
+    )
+}
+
+/// The detail panel's big preview of one file, as Finder shows it: the full picture for a photo,
+/// the thumbnail for anything a thumbnailer drew, the first lines of text. None when the file
+/// only has an icon.
+fn detail_preview<'a>(item: &Item, size: f32) -> Option<Element<'a, Message>> {
+    let inner: Element<'a, Message> = match item.thumbnail_opt.as_ref()? {
+        ItemThumbnail::NotImage => return None,
+        ItemThumbnail::Image(handle, dims) => {
+            let handle = match (item.path_opt(), dims) {
+                (Some(path), Some((w, h)))
+                    if item.mime.type_() == mime::IMAGE && !should_use_tiling(*w, *h) =>
+                {
+                    widget::image::Handle::from_path(path)
+                }
+                _ => handle.clone(),
+            };
+            widget::image(handle)
+                .content_fit(ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        }
+        ItemThumbnail::Preview(handle) => widget::image(handle.clone())
+            .content_fit(ContentFit::Contain)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        ItemThumbnail::Svg(handle) => widget::svg(handle.clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        ItemThumbnail::Text(content) => return Some(text_page(content, size)),
+    };
+    Some(crate::ariadne_ui::matte(
+        widget::container(inner)
+            .padding(8)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        size,
+    ))
+}
+
 /// Maximum bytes of text to pass to the editor for preview; caps shaping work to avoid blocking.
 /// Files larger than this get a truncated preview (first N bytes only).
 const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024; // 256 KiB
@@ -218,6 +309,52 @@ fn button_appearance(
     appearance
 }
 
+/// A list row in the palette's terms (see `crate::palette::row_appearance`); `peak` is the
+/// middle of the selection's arrival flash.
+fn row_style(selected: bool, highlighted: bool, cut: bool, peak: bool) -> theme::Button {
+    let look = move |focused, theme: &theme::Theme| {
+        crate::palette::flash(
+            crate::palette::row_appearance(
+                button_appearance(theme, selected, highlighted, cut, focused, true, true, false),
+                selected,
+                highlighted,
+            ),
+            selected,
+            peak,
+        )
+    };
+    theme::Button::Custom {
+        active: Box::new(look),
+        disabled: Box::new(move |theme| look(false, theme)),
+        hovered: Box::new(look),
+        pressed: Box::new(look),
+    }
+}
+
+/// A grid item's name: the stock look, with the selection's arrival flash under the palette.
+fn name_style(selected: bool, highlighted: bool, cut: bool, desktop: bool, peak: bool) -> theme::Button {
+    let look = move |focused, theme: &theme::Theme| {
+        crate::palette::flash(
+            button_appearance(theme, selected, highlighted, cut, focused, true, true, desktop),
+            selected,
+            peak,
+        )
+    };
+    theme::Button::Custom {
+        active: Box::new(look),
+        disabled: Box::new(move |theme| look(false, theme)),
+        hovered: Box::new(look),
+        pressed: Box::new(look),
+    }
+}
+
+/// The list's left margin, where the game's cursor lozenge sits beside the row it marks.
+const CURSOR_GAP: f32 = 11.0;
+
+/// The selection's arrival flash (manifest section 7): `accent`, `border_mid` from 25% of the
+/// 800ms, `accent` again from 87.5%. Discrete, once per cursor move.
+const FLASH: Duration = Duration::from_millis(800);
+
 fn button_style(
     selected: bool,
     highlighted: bool,
@@ -280,10 +417,31 @@ fn button_style(
 }
 
 pub fn folder_icon(path: &PathBuf, icon_size: u16) -> widget::icon::Handle {
-    widget::icon::from_name(SPECIAL_DIRS.get(path).map_or("folder", |x| *x))
-        .prefer_svg(true)
+    folder_icon_ink(path, icon_size, false)
+}
+
+fn folder_icon_ink(path: &PathBuf, icon_size: u16, light: bool) -> widget::icon::Handle {
+    let handle = widget::icon::from_name(SPECIAL_DIRS.get(path).map_or("folder", |x| *x))
+        .prefer_svg(crate::palette::prefer_svg())
         .size(icon_size)
-        .handle()
+        .handle();
+    crate::palette::tint_ink(handle, icon_size, light)
+}
+
+/// A list row's icon: as loaded, or redrawn in the light ink on the selection's dark fill (a
+/// thumbnail keeps its own colours).
+fn list_icon(item: &Item, handle: &widget::icon::Handle, size: u16) -> widget::icon::Handle {
+    let thumbnail = matches!(
+        item.thumbnail_opt,
+        Some(ItemThumbnail::Image(..) | ItemThumbnail::Svg(_))
+    );
+    if !item.selected || thumbnail || crate::palette::ladder().is_none() {
+        return handle.clone();
+    }
+    match item.path_opt() {
+        Some(path) if item.metadata.is_dir() => folder_icon_ink(path, size, true),
+        _ => crate::mime_icon::mime_icon_ink(item.mime.clone(), size, true),
+    }
 }
 
 pub fn folder_icon_symbolic(path: &PathBuf, icon_size: u16) -> widget::icon::Handle {
@@ -441,6 +599,15 @@ impl Display for FormatTime<'_> {
             return Ok(());
         };
         let now = jiff::Zoned::now();
+        // Under the palette a time reads as an instrument does: numbers in one fixed form,
+        // never the locale's month names.
+        if crate::palette::ladder().is_some() {
+            return if zoned.date() == now.date() {
+                write!(f, "today {}", zoned.strftime("%H:%M"))
+            } else {
+                write!(f, "{}", zoned.strftime("%Y-%m-%d %H:%M"))
+            };
+        }
         let icu_datetime = DateTime::convert_from(zoned.datetime());
         if zoned.date() == now.date() {
             f.write_str(fl!("today").as_str())?;
@@ -782,7 +949,9 @@ pub fn item_from_gvfs_info(path: PathBuf, file_info: gio::FileInfo, sizes: IconS
 
 pub fn item_from_search_item(search_item: SearchItem, sizes: IconSizes) -> Item {
     match search_item {
-        SearchItem::Path(path, name, metadata) => item_from_entry(path, name, metadata, sizes),
+        SearchItem::Path(path, name, metadata) | SearchItem::Ranked(path, name, metadata) => {
+            item_from_entry(path, name, metadata, sizes)
+        }
         SearchItem::Trash(entry, metadata) => item_from_trash_entry(entry, metadata, sizes),
     }
 }
@@ -1158,6 +1327,28 @@ pub fn scan_search<F: Fn(SearchItem) -> bool + Sync>(
 
     match search_location {
         SearchLocation::Path(tab_path) => {
+            // Matches by meaning first, then filename matches the daemon did not already give.
+            let ranked = crate::ariadne::search(term, tab_path);
+            let mut sent = std::collections::HashSet::new();
+            if let Some(paths) = &ranked {
+                for path in paths {
+                    let Ok(metadata) = fs::metadata(path) else {
+                        continue;
+                    };
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if !callback(SearchItem::Ranked(path.clone(), name, metadata)) {
+                        return;
+                    }
+                    sent.insert(path.clone());
+                }
+                if crate::ariadne::is_like(term) {
+                    return;
+                }
+            }
+            let ranked_on = ranked.is_some();
             ignore::WalkBuilder::new(tab_path)
                 .standard_filters(false)
                 .hidden(!show_hidden)
@@ -1176,7 +1367,7 @@ pub fn scan_search<F: Fn(SearchItem) -> bool + Sync>(
                             return ignore::WalkState::Skip;
                         };
 
-                        if regex.is_match(file_name) {
+                        if regex.is_match(file_name) && !sent.contains(entry.path()) {
                             let path = entry.path();
 
                             let metadata = match entry.metadata() {
@@ -1191,11 +1382,16 @@ pub fn scan_search<F: Fn(SearchItem) -> bool + Sync>(
                                 }
                             };
 
-                            if !callback(SearchItem::Path(
-                                path.to_path_buf(),
-                                file_name.to_string(),
-                                metadata,
-                            )) {
+                            let item = if ranked_on {
+                                SearchItem::Ranked(
+                                    path.to_path_buf(),
+                                    file_name.to_string(),
+                                    metadata,
+                                )
+                            } else {
+                                SearchItem::Path(path.to_path_buf(), file_name.to_string(), metadata)
+                            };
+                            if !callback(item) {
                                 return ignore::WalkState::Quit;
                             }
                         }
@@ -1267,6 +1463,18 @@ pub fn has_recents() -> bool {
         Ok(recent_files) => !recent_files.bookmarks.is_empty(),
         Err(_) => false,
     }
+}
+
+/// The Inbox, newest first: files that still exist where the daemon says they are.
+pub fn scan_inbox(sizes: IconSizes) -> Vec<Item> {
+    crate::ariadne::inbox()
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.path.file_name()?.to_string_lossy().to_string();
+            let metadata = entry.path.metadata().ok()?;
+            Some(item_from_entry(entry.path, name, metadata, sizes))
+        })
+        .collect()
 }
 
 pub fn scan_recents(sizes: IconSizes) -> Vec<Item> {
@@ -1499,6 +1707,8 @@ impl std::fmt::Display for SearchLocation {
 #[derive(Clone, Debug)]
 pub enum SearchItem {
     Path(PathBuf, String, fs::Metadata),
+    /// From ariadne: shown in the order received, best match first.
+    Ranked(PathBuf, String, fs::Metadata),
     Trash(TrashItem, TrashItemMetadata),
 }
 
@@ -1515,6 +1725,8 @@ impl From<Location> for EditLocation {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Location {
     Desktop(PathBuf, String, DesktopConfig),
+    /// ariadne's Inbox: new arrivals in the drop zones and where they go.
+    Inbox,
     Network(String, String, Option<PathBuf>),
     Path(PathBuf),
     Recents,
@@ -1528,6 +1740,7 @@ impl std::fmt::Display for Location {
             Self::Desktop(path, display, ..) => {
                 write!(f, "{} on display {display}", path.display())
             }
+            Self::Inbox => write!(f, "inbox"),
             Self::Network(uri, ..) => write!(f, "{uri}"),
             Self::Path(path) => write!(f, "{}", path.display()),
             Self::Recents => write!(f, "recents"),
@@ -1636,6 +1849,7 @@ impl Location {
             }
             Self::Trash => Trash::scan(sizes),
             Self::Recents => scan_recents(sizes),
+            Self::Inbox => scan_inbox(sizes),
             Self::Network(uri, _, _) => scan_network(uri, sizes),
         };
         let parent_item_opt = match self.path_opt() {
@@ -1662,6 +1876,11 @@ impl Location {
                 let (name, _) = folder_name(path);
                 name
             }
+            Self::Search(_, term, ..) if crate::ariadne::is_like(term) => {
+                let path = Path::new(term.trim_start_matches("like:"));
+                let name = path.file_name().map_or(term.clone(), |n| n.to_string_lossy().to_string());
+                format!("Like {name}")
+            }
             Self::Search(location, term, ..) => {
                 let name = match location {
                     SearchLocation::Path(path) => folder_name(path).0,
@@ -1677,6 +1896,9 @@ impl Location {
             }
             Self::Recents => {
                 fl!("recents")
+            }
+            Self::Inbox => {
+                fl!("inbox")
             }
             Self::Network(display_name, ..) => display_name.clone(),
         }
@@ -1772,6 +1994,39 @@ pub enum Command {
 pub enum Message {
     AddNetworkDrive,
     AutoScroll(Option<f32>),
+    /// A button on an Inbox row: Move, Keep or Undo for that file.
+    Inbox(PathBuf, crate::ariadne::InboxVerb),
+    /// Open (or close, with None) ariadne's card for a file.
+    AriadneCard(Option<PathBuf>),
+    /// Show or hide the other folders on the open card.
+    AriadneMore,
+    /// Move, or keep, every file waiting in this folder.
+    AriadneAll(crate::ariadne::InboxVerb),
+    /// Put the cursor on the next file waiting in this folder.
+    AriadneNext,
+    /// Move a waiting file to a folder other than the suggestion.
+    AriadneMoveTo(PathBuf, PathBuf),
+    /// A download that is already filed elsewhere: send it to the trash.
+    AriadneDropCopy(PathBuf),
+    /// The user has seen where a file landed: drop its `new` tag.
+    AriadneSeen(PathBuf),
+    /// The noticed card's buttons: do it, not now (30 days), never (mute this folder).
+    NoticeApply,
+    NoticeLater,
+    NoticeNever,
+    NoticeName(String),
+    /// Edit the selected folder's summary; typing; saving.
+    SummaryEdit,
+    SummaryInput(String),
+    SummarySave,
+    /// Open or close the map view; something happened on it; an animation frame.
+    MapToggle,
+    Map(crate::map::Event),
+    MapTick(Instant),
+    /// ariadne's thread changed: new moves travel across the map.
+    MapMoves,
+    /// Show one move's route again (a knot was clicked).
+    MapReplay(PathBuf, PathBuf),
     Click(Option<usize>),
     DoubleClick(Option<usize>),
     ClickRelease(Option<usize>),
@@ -1968,6 +2223,8 @@ pub enum ItemThumbnail {
     Image(widget::image::Handle, Option<(u32, u32)>),
     Svg(widget::svg::Handle),
     Text(widget::text_editor::Content),
+    /// A picture for the detail panel only; the tile keeps its icon.
+    Preview(widget::image::Handle),
 }
 
 impl Clone for ItemThumbnail {
@@ -1976,6 +2233,7 @@ impl Clone for ItemThumbnail {
             Self::NotImage => Self::NotImage,
             Self::Image(handle, size_opt) => Self::Image(handle.clone(), *size_opt),
             Self::Svg(handle) => Self::Svg(handle.clone()),
+            Self::Preview(handle) => Self::Preview(handle.clone()),
             // Content cannot be cloned simply
             Self::Text(content) => {
                 Self::Text(widget::text_editor::Content::with_text(&content.text()))
@@ -1985,6 +2243,19 @@ impl Clone for ItemThumbnail {
 }
 
 impl ItemThumbnail {
+    /// Whether a thumbnail of this kind belongs only in the detail panel: 3D models, and a PDF
+    /// whose first page is text rather than a cover. `picture` decodes it, only for a PDF.
+    fn preview_only(
+        mime: &mime::Mime,
+        picture: impl FnOnce() -> Option<image::RgbaImage>,
+    ) -> bool {
+        if mime.type_().as_str() == "model" {
+            return true;
+        }
+        mime.essence_str() == "application/pdf"
+            && !picture().is_some_and(|page| crate::thumbnailer::is_cover(&page))
+    }
+
     pub fn new(
         path: &Path,
         metadata: ItemMetadata,
@@ -2006,10 +2277,13 @@ impl ItemThumbnail {
                         Err(_) => size.map(|s| (s.pixel_size(), s.pixel_size())),
                     };
 
-                    return Self::Image(
-                        widget::image::Handle::from_path(thumbnail_path),
-                        original_dims,
-                    );
+                    let handle = widget::image::Handle::from_path(&thumbnail_path);
+                    if Self::preview_only(&mime, || {
+                        image::open(&thumbnail_path).ok().map(DynamicImage::into_rgba8)
+                    }) {
+                        return Self::Preview(handle);
+                    }
+                    return Self::Image(handle, original_dims);
                 }
                 CachedThumbnail::Failed => {
                     if mime.type_() != mime::IMAGE {
@@ -2142,6 +2416,36 @@ impl ItemThumbnail {
             }
         }
 
+        // A slicer's 3MF carries its own render of the model.
+        if matches!(
+            mime.essence_str(),
+            "model/3mf" | "application/vnd.ms-3mfdocument"
+        ) {
+            tried_supported_file = true;
+            if let Some(dyn_img) = crate::thumbnailer::embedded_3mf(path) {
+                match thumbnail_cacher.as_ref() {
+                    Ok(cacher) => match cacher.update_with_image(dyn_img) {
+                        Ok(thumb_path) => {
+                            return Self::Preview(widget::image::Handle::from_path(thumb_path));
+                        }
+                        Err(err) => {
+                            log::warn!("cacher failed for {}: {}", path.display(), err);
+                        }
+                    },
+                    Err(_) => {
+                        let thumbnail = dyn_img
+                            .thumbnail(thumbnail_size, thumbnail_size)
+                            .into_rgba8();
+                        return Self::Preview(widget::image::Handle::from_rgba(
+                            thumbnail.width(),
+                            thumbnail.height(),
+                            thumbnail.into_raw(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Try external thumbnailers.
         let thumbnail_dir = thumbnail_cacher
             .as_ref()
@@ -2248,9 +2552,12 @@ impl ItemThumbnail {
             // the apparmor config for evince-thumbnailer does not allow this, so we need to
             // fallback to the system tempdir.
             let dir = if is_evince { None } else { thumbnail_dir };
+            // Some thumbnailers (f3d) pick the output format from the extension.
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(prefix).suffix(".png");
             let file = match dir {
-                Some(d) => tempfile::Builder::new().prefix(prefix).tempfile_in(d),
-                None => tempfile::Builder::new().prefix(prefix).tempfile(),
+                Some(d) => builder.tempfile_in(d),
+                None => builder.tempfile(),
             };
             let file = match file {
                 Ok(ok) => ok,
@@ -2275,17 +2582,18 @@ impl ItemThumbnail {
                         {
                             Ok(reader) => match reader.decode().map(DynamicImage::into_rgba8) {
                                 Ok(image) => {
-                                    return Some((
-                                        Self::Image(
-                                            widget::image::Handle::from_rgba(
-                                                image.width(),
-                                                image.height(),
-                                                image.into_raw(),
-                                            ),
-                                            None,
-                                        ),
-                                        file,
-                                    ));
+                                    let preview = Self::preview_only(mime, || Some(image.clone()));
+                                    let handle = widget::image::Handle::from_rgba(
+                                        image.width(),
+                                        image.height(),
+                                        image.into_raw(),
+                                    );
+                                    let thumbnail = if preview {
+                                        Self::Preview(handle)
+                                    } else {
+                                        Self::Image(handle, None)
+                                    };
+                                    return Some((thumbnail, file));
                                 }
                                 Err(err) => {
                                     log::warn!("failed to decode {}: {}", path.display(), err);
@@ -2353,7 +2661,7 @@ impl Item {
     fn grid_display_name<'a>(
         name: impl Into<Cow<'a, str>> + 'a,
     ) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
-        widget::text::body(name)
+        crate::palette::body(name)
             .wrapping(text::Wrapping::WordOrGlyph)
             .align_x(text::Alignment::Center)
             .ellipsize(text::Ellipsize::Middle(text::EllipsizeHeightLimit::Lines(
@@ -2365,7 +2673,7 @@ impl Item {
     fn list_display_name<'a>(
         name: impl Into<Cow<'a, str>> + 'a,
     ) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
-        widget::text::body(name)
+        crate::palette::body(name)
             .wrapping(text::Wrapping::WordOrGlyph)
             .ellipsize(text::Ellipsize::Middle(text::EllipsizeHeightLimit::Lines(
                 1,
@@ -2417,6 +2725,7 @@ impl Item {
                 .height(Length::Fixed(THUMBNAIL_SIZE as f32))
                 .padding(spacing.space_xxs)
                 .into(),
+            ItemThumbnail::Preview(handle) => widget::image(handle.clone()).into(),
         }
     }
 
@@ -2464,7 +2773,7 @@ impl Item {
 
         let mut details = widget::column::with_capacity(8).spacing(space_xxxs);
         details = details.push(widget::selectable_text::heading(self.name.clone()));
-        details = details.push(widget::text::body(fl!(
+        details = details.push(crate::palette::body(fl!(
             "type",
             mime = self.mime.to_string()
         )));
@@ -2498,7 +2807,7 @@ impl Item {
         if let Some(metadata) = self.file_metadata() {
             if metadata.is_dir() {
                 if let Some(children) = self.metadata.children_count() {
-                    details = details.push(widget::text::body(fl!("items", items = children)));
+                    details = details.push(crate::palette::body(fl!("items", items = children)));
                 }
                 let size = match &self.dir_size {
                     DirSize::Calculating(_) => fl!("calculating"),
@@ -2507,10 +2816,10 @@ impl Item {
                     DirSize::Error(err) => err.clone(),
                 };
                 if !size.is_empty() {
-                    details = details.push(widget::text::body(fl!("item-size", size = size)));
+                    details = details.push(crate::palette::body(fl!("item-size", size = size)));
                 }
             } else {
-                details = details.push(widget::text::body(fl!(
+                details = details.push(crate::palette::body(fl!(
                     "item-size",
                     size = format_size(metadata.len())
                 )));
@@ -2612,7 +2921,7 @@ impl Item {
             && let Ok(img) = image::image_dimensions(path)
         {
             let (width, height) = img;
-            details = details.push(widget::text::body(format!("{width}x{height}")));
+            details = details.push(crate::palette::body(format!("{width}x{height}")));
         }
         column = column.push(details);
 
@@ -2628,20 +2937,20 @@ impl Item {
                     .align_y(Alignment::Center)
                     .spacing(space_xxxs)
                     .push(widget::indeterminate_circular().size(16.0))
-                    .push(widget::text::body(fl!("calculating")))
+                    .push(crate::palette::body(fl!("calculating")))
                     .into(),
                 ChecksumState::Calculated(checksums) => {
                     let value = checksums.sha256.clone();
                     // Middle-ellipsize the digest to fit, full value on hover.
                     let value_text = widget::tooltip(
-                        widget::text::body(value.clone())
+                        crate::palette::body(value.clone())
                             .font(cosmic::font::mono())
                             .width(Length::Fill)
                             .wrapping(text::Wrapping::None)
                             .ellipsize(text::Ellipsize::Middle(text::EllipsizeHeightLimit::Lines(
                                 1,
                             ))),
-                        widget::text::body(value.clone()),
+                        crate::palette::body(value.clone()),
                         widget::tooltip::Position::Bottom,
                     );
                     let copy_button = widget::button::icon(
@@ -2657,7 +2966,7 @@ impl Item {
                         .into()
                 }
                 ChecksumState::Error(err) => {
-                    widget::text::body(format!("{}: {}", fl!("error"), err)).into()
+                    crate::palette::body(format!("{}: {}", fl!("error"), err)).into()
                 }
             };
             settings.push(
@@ -2700,10 +3009,10 @@ impl Item {
         {
             if metadata.is_dir() {
                 if let Some(children) = children_opt {
-                    column = column.push(widget::text::body(format!("Items: {children}")));
+                    column = column.push(crate::palette::body(format!("Items: {children}")));
                 }
             } else {
-                column = column.push(widget::text::body(format!(
+                column = column.push(crate::palette::body(format!(
                     "Size: {}",
                     format_size(metadata.len())
                 )));
@@ -2712,7 +3021,7 @@ impl Item {
                 let date_time_formatter = date_time_formatter(military_time);
                 let time_formatter = time_formatter(military_time);
 
-                column = column.push(widget::text::body(format!(
+                column = column.push(crate::palette::body(format!(
                     "Last modified: {}",
                     format_time(time, &date_time_formatter, &time_formatter)
                 )));
@@ -2827,11 +3136,32 @@ pub struct Tab {
     pub dnd_hovered: Option<(Location, Instant)>,
     pub(crate) scrollable_id: widget::Id,
     select_focus: Option<usize>,
+    /// Where the cursor last landed and when, for the arrival flash.
+    flash: Option<(usize, Instant)>,
     select_range: Option<(usize, usize)>,
     clicked: Option<usize>,
     selected_clicked: bool,
     last_right_click: Option<usize>,
     search_context: Option<SearchContext>,
+    /// Search results came from ariadne: keep their order instead of sorting by date.
+    ranked_search: bool,
+    /// The file whose ariadne card is open, and whether it shows the other folders.
+    ariadne_card: Option<PathBuf>,
+    ariadne_more: bool,
+    /// Files whose `new` tag the user dismissed.
+    ariadne_seen: std::collections::HashSet<PathBuf>,
+    /// ariadne noticed something about this folder: at most one card per visit.
+    noticed: Option<crate::ariadne::Proposal>,
+    /// The new folder's name on a group card, as edited.
+    noticed_name: String,
+    /// What ariadne says about the file in the preview: (file, line).
+    peek: Option<(PathBuf, String)>,
+    /// Folder summaries fetched on hover, and the one being edited.
+    summaries: std::collections::HashMap<PathBuf, String>,
+    summary_edit: Option<(PathBuf, String)>,
+    /// The map view when open, and the newest move it has already shown travelling.
+    map: Option<crate::map::Map>,
+    map_seen: u64,
     date_time_formatter: DateTimeFormatter<fieldsets::YMDT>,
     time_formatter: DateTimeFormatter<fieldsets::T>,
     window_id: Option<window::Id>,
@@ -2970,12 +3300,24 @@ impl Tab {
             items_opt: None,
             scrollable_id,
             select_focus: None,
+            flash: None,
             select_range: None,
             clicked: None,
             dnd_hovered: None,
             selected_clicked: false,
             last_right_click: None,
             search_context: None,
+            ranked_search: false,
+            ariadne_card: None,
+            ariadne_more: false,
+            ariadne_seen: std::collections::HashSet::new(),
+            noticed: None,
+            noticed_name: String::new(),
+            peek: None,
+            summaries: std::collections::HashMap::new(),
+            summary_edit: None,
+            map: None,
+            map_seen: 0,
             date_time_formatter: date_time_formatter(config.military_time),
             time_formatter: time_formatter(config.military_time),
             window_id,
@@ -3496,6 +3838,19 @@ impl Tab {
         self.scroll_opt = None;
         self.select_focus = None;
         self.search_context = None;
+        // One card per folder visit, and only for sure ideas; the rest wait in Tidy.
+        self.ariadne_card = None;
+        self.noticed = match &self.location {
+            Location::Path(dir) if matches!(self.mode, Mode::App) => crate::ariadne::proposals(Some(dir))
+                .into_iter()
+                .find(|p| p.confidence >= 0.9),
+            _ => None,
+        };
+        self.noticed_name = self
+            .noticed
+            .as_ref()
+            .and_then(|p| p.name.clone())
+            .unwrap_or_default();
         if let Some(history_i) = history_i_opt {
             // Navigating in history
             self.history_i = history_i;
@@ -3529,6 +3884,7 @@ impl Tab {
     }
 
     pub fn update(&mut self, message: Message, modifiers: Modifiers) -> Vec<Command> {
+        let focus_before = self.select_focus;
         let mut commands = Vec::new();
         let mut cd = None;
         let mut history_i_opt = None;
@@ -3939,6 +4295,7 @@ impl Tab {
 
                 if gallery {
                     commands.extend(self.trigger_async_decode());
+                    self.refresh_peek();
                 }
             }
             Message::GalleryPrevious | Message::GalleryNext => {
@@ -3969,6 +4326,7 @@ impl Tab {
                     self.select_position(row, col, mod_shift);
 
                     commands.extend(self.trigger_async_decode());
+                    self.refresh_peek();
                 }
                 if let Some(offset) = self.select_focus_scroll() {
                     commands.push(Command::Iced(
@@ -3994,6 +4352,7 @@ impl Tab {
 
                             if self.gallery {
                                 commands.extend(self.trigger_async_decode());
+                                self.refresh_peek();
                             }
                             break;
                         }
@@ -4400,6 +4759,209 @@ impl Tab {
                     }
                 }
             }
+            Message::Inbox(path, verb) => {
+                if !crate::ariadne::act(verb, &path) {
+                    log::warn!("ariadne: {verb:?} failed for {}", path.display());
+                }
+                self.ariadne_card = None;
+                return self.update(Message::Reload, modifiers);
+            }
+            Message::AriadneCard(path) => {
+                self.ariadne_more = false;
+                self.ariadne_card = path;
+            }
+            Message::AriadneMore => {
+                self.ariadne_more = !self.ariadne_more;
+            }
+            Message::AriadneAll(verb) => {
+                for path in self.waiting_here() {
+                    if !crate::ariadne::act(verb, &path) {
+                        log::warn!("ariadne: {verb:?} failed for {}", path.display());
+                    }
+                }
+                self.ariadne_card = None;
+                return self.update(Message::Reload, modifiers);
+            }
+            Message::AriadneNext => {
+                let waiting = self.waiting_here();
+                // the next waiting file after the cursor, in the order the view shows them
+                let order: Vec<PathBuf> = self
+                    .column_sort()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(_, item)| item.path_opt().cloned())
+                    .filter(|p| waiting.contains(p))
+                    .collect();
+                let at = self
+                    .select_focus
+                    .and_then(|i| self.items_opt.as_ref()?.get(i)?.path_opt().cloned())
+                    .and_then(|p| order.iter().position(|o| *o == p));
+                let next = match at {
+                    Some(i) => order.get(i + 1).or_else(|| order.first()),
+                    None => order.first(),
+                };
+                if let Some(next) = next.cloned() {
+                    self.select_paths(vec![next]);
+                    if let Some(offset) = self.select_focus_scroll() {
+                        commands.push(Command::Iced(
+                            scrollable::scroll_to(
+                                self.scrollable_id.clone(),
+                                AbsoluteOffset {
+                                    x: Some(offset.x),
+                                    y: Some(offset.y),
+                                },
+                            )
+                            .into(),
+                        ));
+                    }
+                    if let Some(id) = self.select_focus_id() {
+                        commands.push(Command::Iced(widget::button::focus(id).into()));
+                    }
+                }
+            }
+            Message::AriadneMoveTo(path, folder) => {
+                if !crate::ariadne::move_to(&path, &folder) {
+                    log::warn!("ariadne: move to {} failed", folder.display());
+                }
+                self.ariadne_card = None;
+                return self.update(Message::Reload, modifiers);
+            }
+            Message::AriadneDropCopy(path) => {
+                self.ariadne_card = None;
+                commands.push(Command::Delete(vec![path]));
+            }
+            Message::AriadneSeen(path) => {
+                self.ariadne_card = None;
+                self.ariadne_seen.insert(path);
+            }
+            Message::NoticeApply => {
+                if let Some(p) = self.noticed.take() {
+                    let name = (p.kind == "group").then_some(self.noticed_name.trim());
+                    if !crate::ariadne::apply(&p.id, name) {
+                        log::warn!("ariadne: applying {} failed", p.id);
+                    }
+                    return self.update(Message::Reload, modifiers);
+                }
+            }
+            Message::NoticeLater => {
+                if let Some(p) = self.noticed.take() {
+                    crate::ariadne::skip(&p.id);
+                }
+            }
+            Message::NoticeNever => {
+                self.noticed = None;
+                if let Some(dir) = self.location.path_opt() {
+                    crate::ariadne::mute(dir);
+                }
+            }
+            Message::NoticeName(name) => {
+                self.noticed_name = name;
+            }
+            Message::MapToggle => {
+                if self.map.take().is_none() {
+                    let snapshot = crate::ariadne::snapshot();
+                    let mut map = crate::map::Map::new();
+                    if let Some(tree) = crate::ariadne::map_tree() {
+                        map.set_tree(tree);
+                    }
+                    map.set_overlays(crate::ariadne::overlays(&snapshot.proposals));
+                    if let Some(here) = self.location.path_opt() {
+                        map.zoom_to(here);
+                    }
+                    self.map_seen = snapshot.moves.iter().map(|m| m.id).max().unwrap_or(0);
+                    self.map = Some(map);
+                }
+            }
+            Message::Map(event) => match event {
+                crate::map::Event::Zoom(path) => {
+                    if let Some(map) = &mut self.map {
+                        map.zoom_to(&path);
+                    }
+                }
+                crate::map::Event::Wheel(view) => {
+                    if let Some(map) = &mut self.map {
+                        map.wheel(view);
+                    }
+                }
+                // Clicking the focused folder again opens it as a grid.
+                crate::map::Event::Open(path) => {
+                    self.map = None;
+                    let dir = if path.is_dir() {
+                        path
+                    } else {
+                        path.parent().map(Path::to_path_buf).unwrap_or(path)
+                    };
+                    return self.update(Message::Location(Location::Path(dir)), modifiers);
+                }
+                crate::map::Event::Hover(_) => {}
+            },
+            Message::MapTick(now) => {
+                if let Some(map) = &mut self.map {
+                    map.tick(now);
+                }
+            }
+            Message::MapMoves => {
+                if let Some(map) = &mut self.map {
+                    let snapshot = crate::ariadne::snapshot();
+                    let fresh: Vec<_> = snapshot
+                        .moves
+                        .iter()
+                        .filter(|m| m.id > self.map_seen)
+                        .collect();
+                    if !fresh.is_empty() {
+                        // The new tree first, so the file is placed before the dot lands.
+                        if let Some(tree) = crate::ariadne::map_tree() {
+                            map.set_tree(tree);
+                        }
+                        for m in fresh {
+                            map.travel(crate::map::Travel {
+                                from: m.from.parent().map(Path::to_path_buf).unwrap_or_default(),
+                                to: m.to.clone(),
+                                started: Instant::now(),
+                            });
+                            self.map_seen = self.map_seen.max(m.id);
+                        }
+                    }
+                    map.set_overlays(crate::ariadne::overlays(&snapshot.proposals));
+                }
+            }
+            Message::MapReplay(from, to) => {
+                if let Some(map) = &mut self.map {
+                    map.travel(crate::map::Travel {
+                        from,
+                        to,
+                        started: Instant::now(),
+                    });
+                }
+            }
+            Message::SummaryEdit => {
+                let folder = self
+                    .items_opt
+                    .as_ref()
+                    .and_then(|items| items.iter().find(|i| i.selected && i.metadata.is_dir()))
+                    .and_then(|i| i.path_opt().cloned());
+                self.summary_edit = folder.map(|folder| {
+                    let text = crate::ariadne::summary(&folder).unwrap_or_default();
+                    (folder, text)
+                });
+                if self.summary_edit.is_some() {
+                    commands.push(Command::Iced(
+                        widget::text_input::focus(crate::ariadne_ui::summary_id()).into(),
+                    ));
+                }
+            }
+            Message::SummaryInput(text) => {
+                if let Some((_, edit)) = &mut self.summary_edit {
+                    *edit = text;
+                }
+            }
+            Message::SummarySave => {
+                if let Some((folder, text)) = self.summary_edit.take() {
+                    if crate::ariadne::set_summary(&folder, text.trim()) {
+                        self.summaries.insert(folder, text.trim().to_string());
+                    }
+                }
+            }
             Message::Reload => {
                 //TODO: support keeping selected locations without paths
                 let selected_paths = self
@@ -4467,6 +5029,14 @@ impl Tab {
             Message::HighlightActivate(i) => {
                 if let Some(item) = self.items_opt.as_mut().and_then(|f| f.get_mut(i)) {
                     item.highlighted = true;
+                    // Hovering a folder shows its summary: fetch it once.
+                    if item.metadata.is_dir()
+                        && let Some(path) = item.path_opt().cloned()
+                        && !self.summaries.contains_key(&path)
+                    {
+                        let text = crate::ariadne::summary(&path).unwrap_or_default();
+                        self.summaries.insert(path, text);
+                    }
                 }
             }
             Message::Resize(viewport) => {
@@ -4520,6 +5090,7 @@ impl Tab {
             Message::SearchContext(location, context) => {
                 if location == self.location {
                     self.search_context = context.0;
+                    self.ranked_search = false;
                 } else {
                     log::warn!(
                         "search context provided for {:?} instead of {:?}",
@@ -4535,6 +5106,9 @@ impl Tab {
                             let duration = Instant::now();
                             while let Ok(search_item) = context.results_rx.try_recv() {
                                 //TODO: combine this with column_sort logic, they must match!
+                                if matches!(search_item, SearchItem::Ranked(..)) {
+                                    self.ranked_search = true;
+                                }
                                 let index =
                                     if let SearchItem::Path(_, _, ref metadata) = search_item {
                                         let item_modified = metadata.modified().ok();
@@ -4692,8 +5266,7 @@ impl Tab {
                                     symbolic: false,
                                     data: widget::icon::Data::Svg(handle.clone()),
                                 }),
-                                //TODO: text thumbnails?
-                                ItemThumbnail::Text(_text) => None,
+                                ItemThumbnail::Text(_) | ItemThumbnail::Preview(_) => None,
                             };
                             if let Some(handle) = handle_opt {
                                 item.icon_handle_grid.clone_from(&handle);
@@ -4942,6 +5515,12 @@ impl Tab {
             }
         }
 
+        // The detail panel shows ariadne's line for the focused file.
+        if self.select_focus != focus_before && crate::palette::ladder().is_some() {
+            self.refresh_peek();
+            self.flash = self.select_focus.map(|i| (i, Instant::now()));
+        }
+
         commands
     }
 
@@ -4961,6 +5540,9 @@ impl Tab {
             if sort { ord } else { ord.reverse() }
         };
         let mut items: Vec<_> = self.items_opt.as_ref()?.iter().enumerate().collect();
+        if self.ranked_search && matches!(self.location, Location::Search(..)) {
+            return Some(items);
+        }
         let (sort_name, sort_direction, folders_first) = self.sort_options();
         match sort_name {
             HeadingOptions::Size => {
@@ -5213,6 +5795,13 @@ impl Tab {
                         .into(),
                     );
                 }
+                ItemThumbnail::Preview(handle) => {
+                    element_opt = Some(
+                        widget::container(crate::load_image::loaded_image(handle.clone()))
+                            .center(Length::Fill)
+                            .into(),
+                    );
+                }
             }
         }
 
@@ -5222,7 +5811,28 @@ impl Tab {
             let mut row = widget::row::with_capacity(5).align_y(Alignment::Center);
             row = row.push(widget::space::horizontal());
             if let Some(name) = name_opt {
-                row = row.push(name);
+                // ariadne's line about the file sits under its name.
+                let focused = self
+                    .select_focus
+                    .and_then(|i| self.items_opt.as_ref()?.get(i))
+                    .and_then(|item| item.path_opt());
+                let line = self
+                    .peek
+                    .as_ref()
+                    .filter(|(path, _)| Some(path) == focused)
+                    .map(|(_, line)| line.clone());
+                let mut name_column = widget::column::with_capacity(2)
+                    .align_x(Alignment::Center)
+                    .push(name);
+                if let Some(line) = line {
+                    name_column = name_column.push(
+                        widget::text::caption(line)
+                            .class(crate::palette::secondary())
+                            .width(Length::Fixed(560.0))
+                            .center(),
+                    );
+                }
+                row = row.push(name_column);
             }
             row = row.push(widget::space::horizontal());
             row = row.push(
@@ -5397,7 +6007,17 @@ impl Tab {
         ])
         .align_y(Alignment::Center)
         .height(Length::Fixed((space_m + 4).into()))
-        .padding([0, space_xxs]);
+        .padding(if crate::palette::ladder().is_some() {
+            // the names start past the cursor's margin, as the rows do
+            cosmic::iced::Padding::from([0.0, f32::from(space_xxs)])
+                .left(f32::from(space_xxs) + crate::yorha::LOZENGE_WIDTH + CURSOR_GAP)
+        } else {
+            cosmic::iced::Padding::from([0.0, f32::from(space_xxs)])
+        });
+        // The column header is a slab: the one dark, light ink.
+        let heading_row = widget::container(heading_row)
+            .width(Length::Fill)
+            .class(crate::palette::slab());
 
         let accent_rule =
             rule::horizontal(1).class(theme::Rule::Custom(Box::new(|theme| rule::Style {
@@ -5460,7 +6080,7 @@ impl Tab {
                     for (i, (name, _path)) in completions.iter().enumerate() {
                         let selected = edit_location.selected == Some(i);
                         column = column.push(
-                            widget::button::custom(widget::text::body(name))
+                            widget::button::custom(crate::palette::body(name))
                                 //TODO: match to design
                                 .class(if selected {
                                     theme::Button::Standard
@@ -5483,7 +6103,7 @@ impl Tab {
                 let mut column = widget::column::with_capacity(4).padding([0, space_s]);
                 column = column.push(row);
                 column = column.push(accent_rule);
-                if self.config.view == View::List && !condensed {
+                if self.config.view == View::List && !condensed && self.map.is_none() {
                     column = column.push(heading_row);
                     column = column.push(heading_rule);
                 }
@@ -5530,7 +6150,7 @@ impl Tab {
                         w += 16.0;
                         (
                             text_width_body(&name),
-                            widget::text::body(name).wrapping(text::Wrapping::None),
+                            crate::palette::body(name).wrapping(text::Wrapping::None),
                         )
                     };
 
@@ -5544,7 +6164,7 @@ impl Tab {
                     let overflow_offset = 64.0;
                     let overflow = w + name_width + overflow_offset > size.width && index > 0;
                     if overflow {
-                        row = row.push(widget::text::body(excess_str));
+                        row = row.push(crate::palette::body(excess_str));
                         w += excess_width;
                     } else {
                         row = row.push(name_text);
@@ -5609,6 +6229,15 @@ impl Tab {
                         .into(),
                 );
             }
+            Location::Inbox => {
+                children.push(
+                    widget::button::custom(widget::text::heading(fl!("inbox")))
+                        .padding(space_xxxs)
+                        .on_press(Message::Location(Location::Inbox))
+                        .class(theme::Button::Text)
+                        .into(),
+                );
+            }
             Location::Network(uri, display_name, path) => {
                 children.push(
                     widget::button::custom(widget::text::heading(display_name))
@@ -5626,10 +6255,14 @@ impl Tab {
 
         row = row.extend(children);
         let mut column = widget::column::with_capacity(4).padding([0, space_s]);
-        column = column.push(row);
-        column = column.push(accent_rule);
+        if crate::palette::ladder().is_some() {
+            column = column.push(crate::ariadne_ui::well("where", row.into()));
+        } else {
+            column = column.push(row);
+            column = column.push(accent_rule);
+        }
 
-        if self.config.view == View::List && !condensed {
+        if self.config.view == View::List && !condensed && self.map.is_none() {
             column = column.push(heading_row);
             column = column.push(heading_rule);
         }
@@ -5640,21 +6273,31 @@ impl Tab {
     pub fn empty_view(&self, has_hidden: bool) -> Element<'_, Message> {
         let cosmic_theme::Spacing { space_xxs, .. } = theme::spacing();
 
+        let line = if has_hidden {
+            fl!("empty-folder-hidden")
+        } else if self.location == Location::Inbox {
+            fl!("inbox-empty")
+        } else if matches!(self.location, Location::Search(..)) {
+            fl!("no-results")
+        } else {
+            fl!("empty-folder")
+        };
         mouse_area::MouseArea::new(widget::column::with_children([widget::container(
             match self.mode {
+                // Under the palette an empty view says so in the instrument register, as a
+                // gauge reads `--`: no picture, no sentence.
+                Mode::App | Mode::Dialog(_) if crate::palette::ladder().is_some() => {
+                    widget::column::with_children([crate::yorha::micro(
+                        &line,
+                        crate::yorha::Tone::Disabled,
+                    )])
+                }
                 Mode::App | Mode::Dialog(_) => widget::column::with_children([
                     widget::icon::from_name("folder-symbolic")
                         .size(64)
                         .icon()
                         .into(),
-                    widget::text::body(if has_hidden {
-                        fl!("empty-folder-hidden")
-                    } else if matches!(self.location, Location::Search(..)) {
-                        fl!("no-results")
-                    } else {
-                        fl!("empty-folder")
-                    })
-                    .into(),
+                    crate::palette::body(line).into(),
                 ]),
                 Mode::Desktop => widget::column::with_capacity(0),
             }
@@ -5664,6 +6307,333 @@ impl Tab {
         .center(Length::Fill)
         .into()]))
         .on_press(|_| Message::Click(None))
+        .into()
+    }
+
+    pub fn map_open(&self) -> bool {
+        self.map.is_some()
+    }
+
+    /// While the map moves, the app sends it animation frames.
+    pub fn map_animating(&self) -> bool {
+        self.map.as_ref().is_some_and(crate::map::Map::is_animating)
+    }
+
+    /// The files waiting for a yes in this folder, copies aside (they have their own card).
+    pub fn waiting_here(&self) -> Vec<PathBuf> {
+        let Some(dir) = self.location.path_opt() else {
+            return Vec::new();
+        };
+        crate::ariadne::snapshot()
+            .inbox
+            .iter()
+            .filter(|e| e.suggested() && e.dup_of.is_none() && e.path.parent() == Some(dir))
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
+    /// While the cursor's arrival flash runs, the app redraws.
+    pub fn flashing(&self) -> bool {
+        self.flash.is_some_and(|(_, at)| at.elapsed() < FLASH)
+    }
+
+    /// Whether item `i` is in the middle of its flash: `border_mid` from 25% to 87.5%.
+    fn peak(&self, i: usize) -> bool {
+        self.flash.is_some_and(|(j, at)| {
+            let t = at.elapsed();
+            j == i && t >= FLASH / 4 && t < FLASH * 7 / 8
+        })
+    }
+
+    /// Ask ariadne what the focused file is, for the line under the preview.
+    fn refresh_peek(&mut self) {
+        let path = self
+            .select_focus
+            .and_then(|i| self.items_opt.as_ref()?.get(i))
+            .and_then(|item| item.path_opt().cloned());
+        self.peek = path.and_then(|path| {
+            let line = crate::ariadne::peek(&path)?;
+            Some((path, line))
+        });
+    }
+
+    /// The detail panel beside the items under the palette theme, as the launcher's detail pane: a
+    /// plate header, the thing in a matte beside its title lockup, label and value rows, its kind as
+    /// tags, and what ariadne knows about it. With nothing selected it describes the folder.
+    fn detail_view(&self) -> Element<'_, Message> {
+        use crate::ariadne_ui::{field, lockup, matte, plate_header, tag};
+        let items: &[Item] = self.items_opt().map_or(&[], |v| v.as_slice());
+        let shown = |i: &&Item| !i.hidden || self.config.show_hidden;
+        let selected: Vec<&Item> = items.iter().filter(shown).filter(|i| i.selected).collect();
+        let home = crate::home_dir();
+        let short = |p: &Path| match p.strip_prefix(&home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => p.display().to_string(),
+        };
+        let when = |t: SystemTime| {
+            format_time(t, &self.date_time_formatter, &self.time_formatter).to_string()
+        };
+
+        let mut col = widget::column::with_capacity(12).spacing(8);
+        let mut fields = widget::column::with_capacity(8).spacing(4);
+        let mut tags = widget::row::with_capacity(3).spacing(4);
+        match selected.as_slice() {
+            [item] => {
+                let is_dir = item.metadata.is_dir();
+                let sub = if is_dir {
+                    item.metadata
+                        .children_count()
+                        .map_or_else(String::new, |n| format!("{n} items"))
+                } else {
+                    item.mime.essence_str().to_string()
+                };
+                // A file with a picture shows it large above its title; an icon stays small
+                // beside it.
+                col = match detail_preview(item, DETAIL_WIDTH - 32.0) {
+                    Some(preview) => col.push(preview).push(lockup(&item.name, sub)),
+                    None => col.push(
+                        widget::row::with_children([
+                            matte(
+                                widget::icon::icon(item.icon_handle_grid.clone())
+                                    .size(64)
+                                    .into(),
+                                80.0,
+                            ),
+                            lockup(&item.name, sub),
+                        ])
+                        .spacing(16)
+                        .align_y(Alignment::Center),
+                    ),
+                };
+                let size = if is_dir {
+                    match &item.dir_size {
+                        DirSize::Directory(size) => format_size(*size),
+                        _ => "--".to_string(),
+                    }
+                } else {
+                    item.metadata.file_size().map_or("--".to_string(), format_size)
+                };
+                fields = fields.push(field("Size", size));
+                if let Some(t) = item.metadata.modified() {
+                    fields = fields.push(field("Modified", when(t)));
+                }
+                if let Some(path) = item.path_opt() {
+                    if let Some(parent) = path.parent() {
+                        fields = fields.push(field("Where", short(parent)));
+                    }
+                    match self.ariadne_mark(path) {
+                        Some(crate::ariadne::Mark::Waiting(e)) => {
+                            fields = fields.push(field(
+                                "ariadne",
+                                format!(
+                                    "→ {}  {:.0}%",
+                                    crate::ariadne::folder_name(&e.folder),
+                                    e.share.unwrap_or(0.0) * 100.0
+                                ),
+                            ));
+                        }
+                        Some(crate::ariadne::Mark::Copy(_)) => {
+                            fields = fields.push(field("ariadne", "a copy".to_string()));
+                        }
+                        Some(crate::ariadne::Mark::New(m)) => {
+                            fields = fields.push(field(
+                                "ariadne",
+                                format!("moved here from {}", short(m.from.parent().unwrap_or(&m.from))),
+                            ));
+                        }
+                        Some(crate::ariadne::Mark::Reading) => {
+                            fields = fields.push(field("ariadne", "reading ▮".to_string()));
+                        }
+                        None => {}
+                    }
+                    if is_dir && let Some(s) = self.summaries.get(path) {
+                        fields = fields.push(field("Summary", s.clone()));
+                    }
+                }
+                if let Some(ext) = Path::new(&item.name).extension().and_then(|e| e.to_str()) {
+                    tags = tags.push(tag(ext, true));
+                }
+                tags = tags.push(tag(if is_dir { "folder" } else { item.mime.type_().as_str() }, false));
+                col = col.push(fields).push(tags);
+                if let Some((path, line)) = &self.peek
+                    && item.path_opt() == Some(path)
+                {
+                    col = col
+                        .push(crate::ariadne_ui::section("peek"))
+                        .push(crate::palette::body(line.clone()));
+                }
+                if let Some(path) = item.path_opt() {
+                    col = col.push(
+                        widget::row::with_children([
+                            crate::palette::act("Open")
+                                .on_press(Message::Open(Some(path.clone())))
+                                .into(),
+                        ]),
+                    );
+                }
+            }
+            [] => {
+                let shown_items: Vec<&Item> = items.iter().filter(shown).collect();
+                let dirs = shown_items.iter().filter(|i| i.metadata.is_dir()).count();
+                let title = self
+                    .location
+                    .path_opt()
+                    .and_then(|p| p.file_name())
+                    .map_or(self.location_title.clone(), |n| n.to_string_lossy().to_string());
+                col = col.push(
+                    widget::row::with_children([
+                        matte(
+                            widget::icon::icon(crate::tab::folder_icon(
+                                &self.location.path_opt().cloned().unwrap_or_default(),
+                                64,
+                            ))
+                            .size(64)
+                            .into(),
+                            80.0,
+                        ),
+                        lockup(&title, format!("{} items", shown_items.len())),
+                    ])
+                    .spacing(16)
+                    .align_y(Alignment::Center),
+                );
+                fields = fields
+                    .push(field("Folders", dirs.to_string()))
+                    .push(field("Files", (shown_items.len() - dirs).to_string()));
+                if let Some(path) = self.location.path_opt() {
+                    if let Some(parent) = path.parent() {
+                        fields = fields.push(field("Where", short(parent)));
+                    }
+                    let ideas = crate::ariadne::snapshot()
+                        .proposals
+                        .iter()
+                        .filter(|p| p.paths.iter().any(|x| x.starts_with(path)))
+                        .count();
+                    if ideas > 0 {
+                        fields = fields.push(field("Tidy", format!("{ideas} ideas")));
+                    }
+                    if let Some(s) = self.summaries.get(path) {
+                        fields = fields.push(field("Summary", s.clone()));
+                    }
+                }
+                col = col.push(fields);
+            }
+            many => {
+                let bytes: u64 = many.iter().filter_map(|i| i.metadata.file_size()).sum();
+                col = col
+                    .push(lockup(&format!("{} items", many.len()), format_size(bytes)));
+            }
+        }
+        let head = match selected.as_slice() {
+            [item] if item.metadata.is_dir() => plate_header("folder", String::new()),
+            [_] => plate_header("file", String::new()),
+            [] => plate_header("folder", String::new()),
+            many => plate_header("selection", format!("{:02}", many.len())),
+        };
+        widget::column::with_children([
+            head,
+            widget::container(col).padding([12, 16, 16, 16]).into(),
+        ])
+        .apply(widget::container)
+        .width(Length::Fixed(DETAIL_WIDTH))
+            .height(Length::Fill)
+            .class(crate::palette::panel())
+            .into()
+    }
+
+    fn ariadne_mark(&self, path: &Path) -> Option<crate::ariadne::Mark> {
+        match crate::ariadne::snapshot().mark(path)? {
+            crate::ariadne::Mark::New(_) if self.ariadne_seen.contains(path) => None,
+            mark => Some(mark),
+        }
+    }
+
+    /// ariadne's pill for an item, with its card open below it when chosen; None when silent.
+    fn ariadne_pill<'a>(&self, item: &Item) -> Option<Element<'a, Message>> {
+        let path = item.path_opt()?;
+        let mark = self.ariadne_mark(path)?;
+        let pill = crate::ariadne_ui::pill(&mark, path);
+        Some(if self.ariadne_card.as_deref() == Some(path.as_path()) {
+            widget::popover(pill)
+                .popup(crate::ariadne_ui::card(&mark, path, self.ariadne_more))
+                .on_close(Message::AriadneCard(None))
+                .position(widget::popover::Position::Bottom)
+                .into()
+        } else {
+            pill
+        })
+    }
+
+    /// A grid item's icon with ariadne's pill over its lower edge.
+    fn ariadne_overlay<'a>(
+        &self,
+        item: &Item,
+        icon: Element<'a, Message>,
+        width: f32,
+    ) -> Element<'a, Message> {
+        // Files the noticed card is about light up.
+        let lit = item
+            .path_opt()
+            .is_some_and(|p| self.noticed.as_ref().is_some_and(|n| n.involves(p)));
+        let icon = if lit {
+            crate::ariadne_ui::lit(icon)
+        } else {
+            icon
+        };
+        // Editing this folder's summary: a small field under its icon.
+        let icon = match &self.summary_edit {
+            Some((folder, text)) if item.path_opt() == Some(folder) => widget::popover(icon)
+                .popup(crate::ariadne_ui::summary_editor(text))
+                .on_close(Message::SummarySave)
+                .position(widget::popover::Position::Bottom)
+                .into(),
+            _ => icon,
+        };
+        let Some(pill) = self.ariadne_pill(item) else {
+            // A folder counts what waits inside it, and its Tidy ideas while the list is open.
+            let count = item
+                .path_opt()
+                .filter(|_| item.metadata.is_dir())
+                .and_then(|dir| {
+                    let snapshot = crate::ariadne::snapshot();
+                    match snapshot.waiting_in(dir) {
+                        0 if crate::ariadne::tidy_open() => match snapshot.ideas_in(dir) {
+                            0 => None,
+                            n => Some(crate::ariadne_ui::count(n, false)),
+                        },
+                        0 => None,
+                        n => Some(crate::ariadne_ui::count(n, true)),
+                    }
+                });
+            let Some(count) = count else {
+                return icon;
+            };
+            return cosmic::iced::widget::Stack::with_children([
+                widget::container(icon)
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center)
+                    .into(),
+                widget::container(count)
+                    .width(Length::Fill)
+                    .align_x(Alignment::End)
+                    .padding([2, 8, 0, 0])
+                    .into(),
+            ])
+            .width(Length::Fixed(width))
+            .into();
+        };
+        cosmic::iced::widget::Stack::with_children([
+            widget::container(icon)
+                .width(Length::Fill)
+                .align_x(Alignment::Center)
+                .into(),
+            widget::container(pill)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::End)
+                .into(),
+        ])
+        .width(Length::Fixed(width))
         .into()
     }
 
@@ -5783,36 +6753,49 @@ impl Tab {
 
                 // Only build elements if visible (for performance)
                 if item_rect.intersects(&visible_rect) {
+                    let icon_button = widget::button::custom(
+                        widget::icon::icon(item.icon_handle_grid.clone())
+                            .content_fit(ContentFit::Contain)
+                            .size(icon_sizes.grid()),
+                    )
+                    .padding(space_xxxs)
+                    .class(button_style(
+                        item.selected,
+                        item.highlighted,
+                        item.cut,
+                        false,
+                        false,
+                        false,
+                    ));
                     //TODO: one focus group per grid item (needs custom widget)
                     let buttons: Vec<Element<Message>> = vec![
-                        widget::button::custom(
-                            widget::icon::icon(item.icon_handle_grid.clone())
-                                .content_fit(ContentFit::Contain)
-                                .size(icon_sizes.grid()),
-                        )
-                        .padding(space_xxxs)
-                        .class(button_style(
-                            item.selected,
-                            item.highlighted,
-                            item.cut,
-                            false,
-                            false,
-                            false,
-                        ))
-                        .into(),
+                        self.ariadne_overlay(item, icon_button.into(), item_width as f32),
                         widget::tooltip(
                             widget::button::custom(Item::grid_display_name(&item.display_name))
                                 .id(item.button_id.clone())
                                 .padding([0, space_xxxs])
-                                .class(button_style(
+                                .class(name_style(
                                     item.selected,
                                     item.highlighted,
                                     item.cut,
-                                    true,
-                                    true,
                                     matches!(self.mode, Mode::Desktop),
+                                    self.peak(i),
                                 )),
-                            widget::text::body(&item.name),
+                            // A folder's tooltip carries its summary, the text Jev routes with.
+                            match item
+                                .path_opt()
+                                .and_then(|p| self.summaries.get(p))
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(summary) => widget::column::with_children([
+                                    crate::palette::body(&item.name).into(),
+                                    widget::text::caption(summary.clone())
+                                        .class(crate::palette::secondary())
+                                        .into(),
+                                ])
+                                .into(),
+                                None => Element::from(crate::palette::body(&item.name)),
+                            },
                             widget::tooltip::Position::Bottom,
                         )
                         .into(),
@@ -5878,6 +6861,29 @@ impl Tab {
                         row = page_row;
                     }
                 } else {
+                    col += 1;
+                    if col >= cols {
+                        col = 0;
+                        row += 1;
+                    }
+                }
+            }
+
+            // Ghosts: files ariadne moved out of this folder today, after the real items.
+            if let Some(dir) = self.location.path_opt() {
+                for m in crate::ariadne::snapshot().ghosts(dir) {
+                    while grid_elements.len() <= row {
+                        grid_elements.push(Vec::new());
+                    }
+                    let mime = crate::mime_icon::mime_for_path(&m.to, None, false);
+                    let icon = crate::mime_icon::mime_icon(mime, icon_sizes.grid());
+                    grid_elements[row].push(crate::ariadne_ui::ghost(
+                        &m,
+                        icon,
+                        item_width as f32,
+                        item_height as f32,
+                    ));
+                    count += 1;
                     col += 1;
                     if col >= cols {
                         col = 0;
@@ -6031,7 +7037,8 @@ impl Tab {
         let size_width = 100.0;
         let condensed = size.width < (name_width + modified_width + size_width);
         let is_search = matches!(self.location, Location::Search(..));
-        let icon_size = if condensed || is_search {
+        let is_inbox = self.location == Location::Inbox;
+        let icon_size = if condensed || is_search || is_inbox {
             icon_sizes.list_condensed()
         } else {
             icon_sizes.list()
@@ -6061,6 +7068,12 @@ impl Tab {
         };
 
         let mut drag_items = Vec::new();
+        // The row the cursor stands on: the focused one, while it is selected.
+        let cursor = self.select_focus.filter(|f| {
+            self.items_opt()
+                .and_then(|items| items.get(*f))
+                .is_some_and(|item| item.selected)
+        });
         if let Some(items) = self.column_sort() {
             let mut count = 0;
             let mut hidden = 0;
@@ -6073,8 +7086,17 @@ impl Tab {
                 }
 
                 if count > 0 {
-                    column = column
-                        .push(widget::container(rule::horizontal(1)).padding([0, rule_padding]));
+                    // Between plates the panel shows through; elsewhere a plain rule.
+                    let gap = rule::horizontal(1).class(theme::Rule::Custom(Box::new(|theme| {
+                        rule::Style {
+                            color: crate::palette::ladder()
+                                .map_or(theme.cosmic().bg_divider().into(), |t| t.highlight()),
+                            radius: 0.0.into(),
+                            fill_mode: rule::FillMode::Full,
+                            snap: true,
+                        }
+                    })));
+                    column = column.push(widget::container(gap).padding([0, rule_padding]));
                     y += 1.0;
                 }
 
@@ -6168,9 +7190,59 @@ impl Tab {
                         }
                     };
 
-                    let row = if condensed {
+                    let row = if is_inbox {
+                        let entry = item.path_opt().and_then(|p| crate::ariadne::inbox_entry(p));
+                        let mut actions = widget::row::with_capacity(2)
+                            .spacing(space_xxs)
+                            .align_y(Alignment::Center);
+                        if let Some(entry) = &entry {
+                            let verb = |v| Message::Inbox(entry.path.clone(), v);
+                            if entry.suggested() {
+                                actions = actions
+                                    .push(
+                                        widget::button::suggested(fl!("inbox-move"))
+                                            .on_press(verb(crate::ariadne::InboxVerb::Move)),
+                                    )
+                                    .push(
+                                        widget::button::standard(fl!("inbox-keep"))
+                                            .on_press(verb(crate::ariadne::InboxVerb::Keep)),
+                                    );
+                            } else {
+                                actions = actions.push(
+                                    widget::button::standard(fl!("inbox-undo"))
+                                        .on_press(verb(crate::ariadne::InboxVerb::Undo)),
+                                );
+                            }
+                        }
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list_condensed.clone())
+                            widget::icon::icon(list_icon(item, &item.icon_handle_list_condensed, icon_size))
+                                .content_fit(ContentFit::Contain)
+                                .size(icon_size)
+                                .into(),
+                            widget::column::with_children([
+                                Item::list_display_name(item.display_name.clone())
+                                    .ellipsize(text::Ellipsize::Middle(
+                                        text::EllipsizeHeightLimit::Lines(1),
+                                    ))
+                                    .into(),
+                                widget::text::caption(
+                                    entry.as_ref().map(|e| e.caption()).unwrap_or_default(),
+                                )
+                                .ellipsize(text::Ellipsize::Middle(
+                                    text::EllipsizeHeightLimit::Lines(1),
+                                ))
+                                .into(),
+                            ])
+                            .width(Length::Fill)
+                            .into(),
+                            actions.into(),
+                        ])
+                        .height(Length::Fixed(f32::from(row_height)))
+                        .align_y(Alignment::Center)
+                        .spacing(space_xxs)
+                    } else if condensed {
+                        widget::row::with_children([
+                            widget::icon::icon(list_icon(item, &item.icon_handle_list_condensed, icon_size))
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_size)
                                 .into(),
@@ -6187,7 +7259,7 @@ impl Tab {
                         .spacing(space_xxs)
                     } else if is_search {
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list_condensed.clone())
+                            widget::icon::icon(list_icon(item, &item.icon_handle_list_condensed, icon_size))
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_size)
                                 .into(),
@@ -6208,10 +7280,10 @@ impl Tab {
                             ])
                             .width(Length::Fill)
                             .into(),
-                            widget::text::body(modified_text.clone())
+                            cell(modified_text.clone(), item.selected)
                                 .width(Length::Fixed(modified_width))
                                 .into(),
-                            widget::text::body(size_text.clone())
+                            cell(size_text.clone(), item.selected)
                                 .width(Length::Fixed(size_width))
                                 .into(),
                         ])
@@ -6220,17 +7292,19 @@ impl Tab {
                         .spacing(space_xxs)
                     } else {
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list.clone())
+                            widget::icon::icon(list_icon(item, &item.icon_handle_list, icon_size))
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_size)
                                 .into(),
                             Item::list_display_name(item.display_name.clone())
                                 .width(Length::Fill)
                                 .into(),
-                            widget::text::body(modified_text.clone())
+                            self.ariadne_pill(item)
+                                .unwrap_or_else(|| widget::space::horizontal().width(0).into()),
+                            cell(modified_text.clone(), item.selected)
                                 .width(Length::Fixed(modified_width))
                                 .into(),
-                            widget::text::body(size_text.clone())
+                            cell(size_text.clone(), item.selected)
                                 .width(Length::Fixed(size_width))
                                 .into(),
                         ])
@@ -6246,13 +7320,11 @@ impl Tab {
                                     .width(Length::Fill)
                                     .id(item.button_id.clone())
                                     .padding([0, space_xxs])
-                                    .class(button_style(
+                                    .class(row_style(
                                         item.selected,
                                         item.highlighted,
                                         item.cut,
-                                        true,
-                                        true,
-                                        false,
+                                        self.peak(i),
                                     )),
                             )
                             .on_press(move |_| Message::Click(Some(i)))
@@ -6283,14 +7355,14 @@ impl Tab {
                             )
                         } else if condensed {
                             widget::row::with_children([
-                                widget::icon::icon(item.icon_handle_list_condensed.clone())
+                                widget::icon::icon(list_icon(item, &item.icon_handle_list_condensed, icon_size))
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_size)
                                     .into(),
                                 widget::column::with_children([
                                     Item::list_display_name(item.display_name.clone()).into(),
                                     //TODO: translate?
-                                    widget::text::body(format!("{modified_text} - {size_text}"))
+                                    crate::palette::body(format!("{modified_text} - {size_text}"))
                                         .into(),
                                 ])
                                 .into(),
@@ -6300,7 +7372,7 @@ impl Tab {
                             .into()
                         } else if is_search {
                             widget::row::with_children([
-                                widget::icon::icon(item.icon_handle_list_condensed.clone())
+                                widget::icon::icon(list_icon(item, &item.icon_handle_list_condensed, icon_size))
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_size)
                                     .into(),
@@ -6321,10 +7393,10 @@ impl Tab {
                                 ])
                                 .width(Length::Fill)
                                 .into(),
-                                widget::text::body(modified_text.clone())
+                                cell(modified_text.clone(), item.selected)
                                     .width(Length::Fixed(modified_width))
                                     .into(),
-                                widget::text::body(size_text.clone())
+                                cell(size_text.clone(), item.selected)
                                     .width(Length::Fixed(size_width))
                                     .into(),
                             ])
@@ -6333,7 +7405,7 @@ impl Tab {
                             .into()
                         } else {
                             widget::row::with_children([
-                                widget::icon::icon(item.icon_handle_list.clone())
+                                widget::icon::icon(list_icon(item, &item.icon_handle_list, icon_size))
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_size)
                                     .into(),
@@ -6343,7 +7415,7 @@ impl Tab {
                                 widget::text(modified_text)
                                     .width(Length::Fixed(modified_width))
                                     .into(),
-                                widget::text::body(size_text)
+                                crate::palette::body(size_text)
                                     .width(Length::Fixed(size_width))
                                     .into(),
                             ])
@@ -6370,6 +7442,22 @@ impl Tab {
                         .into()
                 };
 
+                // Under the palette the cursor lozenge marks the focused row from the margin.
+                let button_row = if crate::palette::ladder().is_some() {
+                    let mark: Element<_> = if cursor == Some(i) {
+                        widget::container(crate::yorha::cursor_lozenge(false))
+                            .center_y(Length::Fixed(f32::from(row_height)))
+                            .into()
+                    } else {
+                        space::horizontal().width(Length::Fixed(crate::yorha::LOZENGE_WIDTH)).into()
+                    };
+                    widget::row::with_children([mark, button_row])
+                        .spacing(CURSOR_GAP)
+                        .into()
+                } else {
+                    button_row
+                };
+
                 count += 1;
                 y += f32::from(row_height);
                 column = column.push(button_row);
@@ -6384,7 +7472,7 @@ impl Tab {
         }
         //TODO: HACK If we don't reach the bottom of the view, go ahead and add a spacer to do that
         {
-            let top_deduct = (if condensed || is_search { 6 } else { 9 }) * space_xxs;
+            let top_deduct = (if condensed || is_search || is_inbox { 6 } else { 9 }) * space_xxs;
 
             self.item_view_size_opt
                 .set(self.size_opt.get().map(|s| Size {
@@ -6420,8 +7508,17 @@ impl Tab {
         clipboard_paste_available: bool,
         context_actions: &'a [ContextActionPreset],
     ) -> Element<'a, Message> {
+        // Under the palette theme the items share the width with the detail panel.
+        let sheet = crate::palette::ladder().is_some() && !matches!(self.mode, Mode::Desktop);
+        // A page beside the items (Tidy, Settings) takes the detail panel's place.
+        let detail = sheet && size.width > 900.0 && self.map.is_none() && !crate::ariadne::side_open();
+        let items_size = if detail {
+            Size::new(size.width - DETAIL_WIDTH - 10.0, size.height)
+        } else {
+            size
+        };
         // Update cached size
-        self.size_opt.set(Some(size));
+        self.size_opt.set(Some(items_size));
 
         let cosmic_theme::Spacing {
             space_xxxs,
@@ -6435,9 +7532,11 @@ impl Tab {
         } else {
             Some(self.location_view())
         };
-        let (drag_list, mut item_view, can_scroll) = match self.config.view {
-            View::Grid => self.grid_view(),
-            View::List => self.list_view(),
+        // The Inbox is always a list: each row carries its destination and buttons.
+        let (drag_list, mut item_view, can_scroll) = match (&self.map, self.config.view) {
+            (Some(map), _) => (None, map.view(Message::Map), false),
+            (None, View::Grid) if self.location != Location::Inbox => self.grid_view(),
+            _ => self.list_view(),
         };
         item_view = widget::container(item_view).width(Length::Fill).into();
         let files = self
@@ -6531,10 +7630,59 @@ impl Tab {
         }
 
         let mut tab_column = widget::column::with_capacity(3);
-        if let Some(location_view) = location_view_opt {
-            tab_column = tab_column.push(location_view);
+        if sheet {
+            // The launcher's sheet: one panel with a header slab (the place, the cursor's index
+            // over the count), the location well, the items; the detail panel beside it.
+            let shown: Vec<&Item> = self
+                .items_opt()
+                .map(|v| v.iter().filter(|i| !i.hidden || self.config.show_hidden).collect())
+                .unwrap_or_default();
+            let at = shown
+                .iter()
+                .position(|i| i.selected)
+                .map_or("--".to_string(), |i| format!("{:02}", i + 1));
+            // a search names what it looks for, a place its own name
+            let label = match &self.location {
+                Location::Search(_, term, ..) => format!("search  {term}"),
+                location => location
+                    .path_opt()
+                    .and_then(|p| p.file_name())
+                    .map_or(self.location_title.clone(), |n| n.to_string_lossy().to_string()),
+            };
+            let mut body = widget::column::with_capacity(3)
+                .push(crate::ariadne_ui::header(&label, format!("{at} / {:02}", shown.len())));
+            if let Some(location_view) = location_view_opt {
+                body = body.push(widget::container(location_view).padding([8, 8, 0, 8]));
+            }
+            body = body.push(context_menu);
+            let main = widget::container(body)
+                .class(crate::palette::panel())
+                .width(Length::Fill)
+                .height(Length::Fill);
+            let mut sheet = widget::row::with_capacity(2).spacing(8).push(main);
+            if detail {
+                sheet = sheet.push(self.detail_view());
+            }
+            tab_column = tab_column.push(widget::container(sheet).padding([0, 2, 2, 0]));
+        } else {
+            if let Some(location_view) = location_view_opt {
+                tab_column = tab_column.push(location_view);
+            }
+            // The items sit on a panel body over the field.
+            tab_column = tab_column.push(
+                widget::container(context_menu)
+                    .class(crate::palette::panel())
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            );
         }
-        tab_column = tab_column.push(context_menu);
+        let waiting = self.waiting_here().len();
+        if waiting > 1 {
+            tab_column = tab_column.push(crate::ariadne_ui::waiting_bar(waiting));
+        }
+        if let Some(p) = &self.noticed {
+            tab_column = tab_column.push(crate::ariadne_ui::noticed(p, &self.noticed_name));
+        }
         match &self.location {
             Location::Trash | Location::Search(SearchLocation::Trash, ..) => {
                 if let Some(items) = self.items_opt()
@@ -6679,7 +7827,7 @@ impl Tab {
         });
 
         let mut details = widget::column::with_capacity(3).spacing(space_xxxs);
-        details = details.push(widget::text::body(fl!(
+        details = details.push(crate::palette::body(fl!(
             "items",
             items = selected_items.len()
         )));
@@ -6748,7 +7896,7 @@ impl Tab {
             mime_type_strings.push("...".to_string());
         }
 
-        details = details.push(widget::text::body(fl!(
+        details = details.push(crate::palette::body(fl!(
             "type",
             mime = mime_type_strings.join(", ")
         )));
@@ -6763,7 +7911,7 @@ impl Tab {
             }
         };
 
-        details = details.push(widget::text::body(fl!("item-size", size = size)));
+        details = details.push(crate::palette::body(fl!("item-size", size = size)));
 
         column = column.push(details);
 

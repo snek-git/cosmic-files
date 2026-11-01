@@ -5,6 +5,7 @@
 use cosmic::desktop::fde::GenericEntry;
 use mime_guess::Mime;
 use rustc_hash::FxHashMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -26,31 +27,45 @@ impl Thumbnailer {
         let mut args = args_vec.iter();
         let mut command = process::Command::new(args.next()?);
         for arg in args {
-            if arg.starts_with('%') {
-                match arg.as_str() {
-                    "%i" | "%u" => {
-                        command.arg(input);
-                    }
-                    "%o" => {
-                        command.arg(output);
-                    }
-                    "%s" => {
-                        command.arg(format!("{thumbnail_size}"));
-                    }
-                    _ => {
-                        log::warn!(
-                            "unsupported thumbnailer Exec code {:?} in {:?}",
-                            arg,
-                            self.exec
-                        );
-                        return None;
-                    }
-                }
-            } else {
-                command.arg(arg);
-            }
+            command.arg(self.expand(arg, input, output, thumbnail_size)?);
         }
         Some(command)
+    }
+
+    /// Fill in the Exec codes of one argument. Codes may sit inside an argument, as in f3d's
+    /// `--output=%o --resolution=%s,%s`.
+    fn expand(&self, arg: &str, input: &Path, output: &Path, thumbnail_size: u32) -> Option<OsString> {
+        let mut expanded = OsString::new();
+        let mut literal = String::new();
+        let mut chars = arg.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                literal.push(c);
+                continue;
+            }
+            let code = chars.next();
+            if code == Some('%') {
+                literal.push('%');
+                continue;
+            }
+            expanded.push(&literal);
+            literal.clear();
+            match code {
+                Some('i' | 'u') => expanded.push(input),
+                Some('o') => expanded.push(output),
+                Some('s') => expanded.push(thumbnail_size.to_string()),
+                _ => {
+                    log::warn!(
+                        "unsupported thumbnailer Exec code {:?} in {:?}",
+                        arg,
+                        self.exec
+                    );
+                    return None;
+                }
+            }
+        }
+        expanded.push(literal);
+        Some(expanded)
     }
 }
 
@@ -165,6 +180,49 @@ impl ThumbnailerCache {
     }
 }
 
+/// Where slicers leave their own render of the model inside a 3MF: the spec's package
+/// thumbnail, then Bambu and Orca's first plate, then MakerWorld's.
+const EMBEDDED_3MF: [&str; 3] = [
+    "Metadata/thumbnail.png",
+    "Metadata/plate_1.png",
+    "Auxiliaries/.thumbnails/thumbnail_3mf.png",
+];
+const EMBEDDED_3MF_MAX_BYTES: u64 = 8 * 1000 * 1000;
+
+/// The picture a slicer saved inside a 3MF. Slicer 3MFs keep the mesh in part files that
+/// assimp (and so f3d) cannot read, but they carry this render; None when there is none.
+pub fn embedded_3mf(path: &Path) -> Option<image::DynamicImage> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(fs::File::open(path).ok()?)
+        .inspect_err(|err| log::warn!("failed to open 3MF {}: {}", path.display(), err))
+        .ok()?;
+    EMBEDDED_3MF.iter().find_map(|name| {
+        let entry = archive.by_name(name).ok()?;
+        if entry.size() > EMBEDDED_3MF_MAX_BYTES {
+            return None;
+        }
+        let mut data = Vec::with_capacity(entry.size() as usize);
+        entry.take(EMBEDDED_3MF_MAX_BYTES).read_to_end(&mut data).ok()?;
+        image::load_from_memory(&data)
+            .inspect_err(|err| log::warn!("failed to decode {name} in {}: {}", path.display(), err))
+            .ok()
+    })
+}
+
+/// Whether a document's first page is a cover rather than a page of text: covers, posters and
+/// decks ink most of the page, text pages a third of it at most.
+pub fn is_cover(page: &image::RgbaImage) -> bool {
+    let pixels = u64::from(page.width()) * u64::from(page.height());
+    if pixels == 0 {
+        return false;
+    }
+    let inked = page
+        .pixels()
+        .filter(|p| p[3] > 128 && p[0].min(p[1]).min(p[2]) < 225)
+        .count() as u64;
+    inked * 10 >= pixels * 4
+}
+
 static THUMBNAILER_CACHE: LazyLock<Mutex<ThumbnailerCache>> =
     LazyLock::new(|| Mutex::new(ThumbnailerCache::new()));
 
@@ -191,6 +249,21 @@ mod tests {
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["output.png", "--size", "128", "input.exe"]
+        );
+    }
+
+    #[test]
+    fn command_expands_codes_inside_arguments() {
+        let thumbnailer = Thumbnailer {
+            exec: "f3d --output=%o --resolution=%s,%s 100%% %i".to_string(),
+        };
+
+        let command = thumbnailer
+            .command(Path::new("model.stl"), Path::new("out.png"), 320)
+            .expect("valid thumbnailer command");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--output=out.png", "--resolution=320,320", "100%", "model.stl"]
         );
     }
 }

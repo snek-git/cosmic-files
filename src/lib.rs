@@ -14,6 +14,8 @@ use crate::tab::Location;
 
 pub mod app;
 mod archive;
+mod ariadne;
+mod ariadne_ui;
 pub mod channel;
 pub mod clipboard;
 pub mod config;
@@ -23,17 +25,20 @@ mod key_bind;
 pub(crate) mod large_image;
 pub(crate) mod load_image;
 mod localize;
+pub mod map;
 mod menu;
 mod mime_app;
 pub mod mime_icon;
 mod mounter;
 mod mouse_area;
 pub mod operation;
+mod palette;
 mod spawn_detached;
 pub mod tab;
 mod thumbnail_cacher;
 mod thumbnailer;
 pub(crate) mod trash;
+pub mod yorha;
 mod zoom;
 
 pub(crate) type FxOrderMap<K, V> = ordermap::OrderMap<K, V, rustc_hash::FxBuildHasher>;
@@ -101,7 +106,8 @@ pub fn desktop() -> Result<(), Box<dyn std::error::Error>> {
     let (state_handler, state) = State::load();
 
     let mut settings = Settings::default();
-    settings = settings.theme(config.app_theme.theme());
+    settings = settings.theme(config.theme());
+    settings = settings.default_text_size(crate::palette::text_size());
     settings = settings.size_limits(Limits::NONE.min_width(360.0).min_height(180.0));
     settings = settings.exit_on_close(false);
     settings = settings.transparent(true);
@@ -204,7 +210,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut settings = Settings::default();
-    settings = settings.theme(config.app_theme.theme());
+    settings = settings.theme(config.theme());
+    settings = settings.default_text_size(crate::palette::text_size());
     settings = settings.size_limits(Limits::NONE.min_width(360.0).min_height(180.0));
     settings = settings.exit_on_close(false);
 

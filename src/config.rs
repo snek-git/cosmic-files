@@ -36,11 +36,17 @@ pub enum AppTheme {
     Dark,
     Light,
     System,
+    /// The colours of a palette file, see `crate::palette`.
+    Palette,
 }
 
 impl AppTheme {
-    pub fn theme(&self) -> theme::Theme {
+    /// `palette` is the file the Palette theme reads; when it cannot be read, follow the system.
+    pub fn theme(&self, palette: &std::path::Path) -> theme::Theme {
         match self {
+            Self::Palette => {
+                crate::palette::theme(palette).unwrap_or_else(theme::system_preference)
+            }
             Self::Dark => {
                 let mut t = theme::system_dark();
                 t.theme_type.prefer_dark(Some(true));
@@ -210,9 +216,28 @@ pub struct Config {
     pub show_recents: bool,
     pub tab: TabConfig,
     pub type_to_search: TypeToSearch,
+    /// The palette file the Palette theme reads, and is reloaded from when it changes.
+    pub palette: PathBuf,
+    /// ariadne's motion: the typed status line, arrival flash, stepped reveals.
+    pub motion: bool,
+    /// ariadne's sounds at the action chokepoints.
+    pub sound: bool,
+    /// The font family the Palette theme sets everywhere.
+    pub font: String,
+    /// The icon theme the Palette theme draws from, tinted to one ink.
+    pub icons: String,
 }
 
 impl Config {
+    pub fn theme(&self) -> theme::Theme {
+        if self.app_theme != AppTheme::Palette {
+            crate::palette::clear();
+        }
+        let theme = self.app_theme.theme(&self.palette);
+        crate::palette::dress(&self.font, &self.icons);
+        theme
+    }
+
     pub fn load() -> (Option<cosmic_config::Config>, Self) {
         match cosmic_config::Config::new(App::APP_ID, CONFIG_VERSION) {
             Ok(config_handler) => {
@@ -257,7 +282,11 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            app_theme: AppTheme::System,
+            app_theme: if crate::palette::default_path().exists() {
+                AppTheme::Palette
+            } else {
+                AppTheme::System
+            },
             desktop: DesktopConfig::default(),
             dialog: DialogConfig::default(),
             context_actions: Vec::new(),
@@ -274,6 +303,11 @@ impl Default for Config {
             show_recents: true,
             tab: TabConfig::default(),
             type_to_search: TypeToSearch::Recursive,
+            palette: crate::palette::default_path(),
+            motion: true,
+            sound: false,
+            font: "Monaco".to_string(),
+            icons: "Ariadne".to_string(),
         }
     }
 }

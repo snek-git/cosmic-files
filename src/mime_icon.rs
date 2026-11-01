@@ -38,7 +38,9 @@ impl MimeIconCache {
                     return None;
                 }
                 let icon_name = icon_names.remove(0);
-                let mut named = icon::from_name(icon_name).prefer_svg(true).size(key.size);
+                let mut named = icon::from_name(icon_name)
+                    .prefer_svg(crate::palette::prefer_svg())
+                    .size(key.size);
                 if !icon_names.is_empty() {
                     let fallback_names =
                         icon_names.into_iter().map(std::borrow::Cow::from).collect();
@@ -52,6 +54,11 @@ impl MimeIconCache {
 
 pub static MIME_ICON_CACHE: LazyLock<Mutex<MimeIconCache>> =
     LazyLock::new(|| Mutex::new(MimeIconCache::default()));
+
+/// Forget the icons looked up so far, after the icon theme changes.
+pub fn forget() {
+    MIME_ICON_CACHE.lock().unwrap().cache.clear();
+}
 
 #[cfg(not(unix))]
 pub fn mime_for_path(
@@ -104,14 +111,20 @@ pub fn mime_for_path(
 }
 
 pub fn mime_icon(mime: Mime, size: u16) -> icon::Handle {
+    mime_icon_ink(mime, size, false)
+}
+
+/// As `mime_icon`, in the light ink when `light` (see `crate::palette::tint_ink`).
+pub fn mime_icon_ink(mime: Mime, size: u16, light: bool) -> icon::Handle {
     let mut mime_icon_cache = MIME_ICON_CACHE.lock().unwrap();
-    match mime_icon_cache.get(MimeIconKey { mime, size }) {
+    let handle = match mime_icon_cache.get(MimeIconKey { mime, size }) {
         Some(handle) => handle,
         None => icon::from_name(FALLBACK_MIME_ICON)
-            .prefer_svg(true)
+            .prefer_svg(crate::palette::prefer_svg())
             .size(size)
             .handle(),
-    }
+    };
+    crate::palette::tint_ink(handle, size, light)
 }
 
 #[cfg(not(unix))]
