@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use cosmic::iced::{Alignment, Background, Border, Length, Shadow, Vector};
+use cosmic::iced::{Alignment, Background, Border, Color, Length, Shadow, Vector};
 use cosmic::iced::widget::container;
 use cosmic::{Element, theme, widget};
 
@@ -31,6 +31,20 @@ pub fn clip(s: &str, max: usize) -> String {
     } else {
         format!("{}…", s.chars().take(max - 1).collect::<String>().trim_end())
     }
+}
+
+/// Shorten from the middle, so a path keeps its root and its last folder, and a file name its
+/// start and extension.
+pub fn clip_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max < 5 {
+        return s.to_string();
+    }
+    let tail = (max - 1) / 2;
+    let head = max - 1 - tail;
+    let start: String = s.chars().take(head).collect();
+    let end: String = s.chars().skip(n - tail).collect();
+    format!("{start}…{end}")
 }
 
 fn pct(share: Option<f32>) -> String {
@@ -313,6 +327,7 @@ pub fn noticed<'a>(p: &Proposal, name: &str) -> Element<'a, Message> {
     if p.kind == "group" {
         row = row.push(
             widget::text_input("", name.to_string())
+                .font(cosmic::font::default())
                 .on_input(Message::NoticeName)
                 .width(Length::Fixed(160.0)),
         );
@@ -371,6 +386,88 @@ pub fn header<'a, M: 'a>(label: &str, value: String) -> Element<'a, M> {
     .width(Length::Fill)
     .class(crate::palette::slab())
     .into()
+}
+
+/// One section of the places panel: its header slab with the count over its places as plates,
+/// or the plates alone when it has no label.
+pub fn place_section<'a, M: 'a>(
+    label: Option<&str>,
+    count: usize,
+    places: Element<'a, M>,
+) -> Element<'a, M> {
+    let places = widget::container(places).padding([8, 8, 8, 8]);
+    match label {
+        Some(label) => widget::column::with_children([
+            header(label, format!("{count:02}")),
+            places.into(),
+        ])
+        .into(),
+        None => places.into(),
+    }
+}
+
+/// The tracks under the Drives rows, laid over them at the rows' pitch: ink for the share taken,
+/// the track tone for the rest, light on the dark of the current drive. `rows` is each row's
+/// share taken (None for a disk that could not be measured) and whether it is lit.
+pub fn usage_tracks<'a, M: 'a>(rows: Vec<(Option<f32>, bool)>, row: u16, spacing: u16) -> Element<'a, M> {
+    let Some(t) = ladder() else {
+        return widget::space::horizontal().into();
+    };
+    let fill = |color: cosmic::iced::Color, portion: u16| -> Element<'a, M> {
+        widget::container(widget::space::horizontal())
+            .width(Length::FillPortion(portion))
+            .height(3)
+            .class(theme::Container::custom(move |_| container::Style {
+                background: Some(Background::Color(color)),
+                ..Default::default()
+            }))
+            .into()
+    };
+    let tracks = rows.into_iter().map(|(used, lit)| {
+        let (taken, rest) = if lit {
+            (t.light(), t.secondary())
+        } else {
+            (t.text(), t.shadow())
+        };
+        let track: Element<'a, M> = match used {
+            Some(used) => {
+                let part = (used.clamp(0.0, 1.0) * 1000.0).round() as u16;
+                widget::row::with_capacity(2)
+                    .push_maybe((part > 0).then(|| fill(taken, part)))
+                    .push_maybe((part < 1000).then(|| fill(rest, 1000 - part)))
+                    .height(3)
+                    .into()
+            }
+            None => widget::space::vertical().height(3).into(),
+        };
+        // Under the name: past the icon and its gap, 6 above the plate's foot.
+        widget::container(track)
+            .padding([f32::from(row) - 9.0, 8.0, 6.0, 32.0])
+            .height(Length::Fixed(f32::from(row)))
+            .width(Length::Fill)
+            .into()
+    });
+    widget::column::with_children(tracks).spacing(spacing).into()
+}
+
+/// The places panel, in the window and the picker alike: the sections in a scroll, and `foot`
+/// (Trash) held at the bottom.
+pub fn places_panel<'a, M: 'a>(
+    sections: Vec<Element<'a, M>>,
+    foot: Option<Element<'a, M>>,
+) -> Element<'a, M> {
+    let body = widget::column::with_capacity(2)
+        .push(
+            widget::scrollable(widget::column::with_children(sections))
+                .class(cosmic::style::iced::Scrollable::Minimal)
+                .height(Length::Fill),
+        )
+        .push_maybe(foot);
+    let panel = widget::container(body)
+        .class(crate::palette::panel())
+        .width(Length::Fixed(232.0))
+        .height(Length::Fill);
+    widget::container(panel).padding([0, 2, 2, 0]).into()
 }
 
 /// The light header of a detail panel: a plate with a solid square and the caps label in ink.
@@ -511,6 +608,435 @@ pub fn well<'a, M: 'a>(label: &str, content: Element<'a, M>) -> Element<'a, M> {
     .into()
 }
 
+/// Every control on the top bar is this tall, so they share one centre line.
+const BAR: f32 = 24.0;
+
+/// Wide enough for a short sentence: search takes queries by meaning.
+const SEARCH_WIDTH: f32 = 320.0;
+
+/// A control on the top bar: a plate at rest when `plate`, otherwise nothing; an ink border on
+/// hover; the one dark while pressed or while `on` (the current view). With nothing to do it
+/// drops its plate and its ink goes to the disabled tone. Icons on it are symbolic, so they take
+/// the same ink as its words.
+pub fn bar_button(plate: bool, on: bool) -> theme::Button {
+    let look = move |hovered: bool, pressed: bool, disabled: bool, theme: &theme::Theme| {
+        let mut s = widget::button::Style::new();
+        s.border_radius = 0.0.into();
+        let Some(t) = ladder() else {
+            let c = theme.cosmic();
+            let (fill, ink): (Color, Color) = if on || pressed {
+                (c.accent_color().into(), c.on_accent_color().into())
+            } else {
+                (c.button_bg_color().into(), c.on_bg_color().into())
+            };
+            let ink = if disabled && !on { Color { a: 0.5, ..ink } } else { ink };
+            s.background = Some(Background::Color(fill));
+            s.text_color = Some(ink);
+            s.icon_color = Some(ink);
+            return s;
+        };
+        if on || pressed {
+            s.background = Some(Background::Color(t.accent()));
+            s.text_color = Some(t.light());
+            s.icon_color = Some(t.light());
+            return s;
+        }
+        if disabled {
+            s.text_color = Some(t.dim());
+            s.icon_color = Some(t.dim());
+            return s;
+        }
+        if plate {
+            s.background = Some(Background::Color(t.base_dim()));
+        }
+        s.text_color = Some(t.text());
+        s.icon_color = Some(t.text());
+        if hovered {
+            s.border_width = 1.0;
+            s.border_color = t.text();
+        }
+        s
+    };
+    theme::Button::Custom {
+        active: Box::new(move |_, theme| look(false, false, false, theme)),
+        disabled: Box::new(move |theme| look(false, false, true, theme)),
+        hovered: Box::new(move |_, theme| look(true, false, false, theme)),
+        pressed: Box::new(move |_, theme| look(true, true, false, theme)),
+    }
+}
+
+/// A word on a plate on the top bar. Without `press` it rests disabled.
+pub fn bar_text<'a, M: Clone + 'a>(label: String, press: Option<M>) -> Element<'a, M> {
+    widget::button::custom(widget::container(crate::palette::body(label)).center_y(Length::Fixed(BAR)))
+        .padding([0, 8])
+        .on_press_maybe(press)
+        .class(bar_button(true, false))
+        .into()
+}
+
+/// An icon on the top bar, in a square of the bar's height.
+pub fn bar_icon<'a, M: Clone + 'static>(
+    icon: widget::icon::Handle,
+    class: theme::Button,
+    press: Option<M>,
+) -> Element<'a, M> {
+    widget::button::custom(widget::container(widget::icon(icon).size(16)).center(Length::Fixed(BAR)))
+        .padding(0)
+        .on_press_maybe(press)
+        .class(class)
+        .into()
+}
+
+/// An icon and a word on the top bar.
+pub fn bar_pair<'a, M: Clone + 'static>(
+    icon: widget::icon::Handle,
+    label: String,
+    class: theme::Button,
+    press: M,
+) -> Element<'a, M> {
+    widget::button::custom(
+        widget::row::with_children([
+            widget::icon(icon).size(16).into(),
+            crate::palette::body(label).into(),
+        ])
+        .spacing(8)
+        .height(Length::Fixed(BAR))
+        .align_y(Alignment::Center),
+    )
+    .padding([0, 8])
+    .on_press(press)
+    .class(class)
+    .into()
+}
+
+/// The top bar's own pictograms, drawn in whatever ink the button gives its icon.
+pub enum Glyph {
+    Grid,
+    List,
+    Map,
+    Tidy,
+    Info,
+    Tick,
+    Dash,
+    Shut,
+    Open,
+    Arrow,
+}
+
+pub fn glyph(g: Glyph) -> widget::icon::Handle {
+    let svg: &'static str = match g {
+        Glyph::Grid => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M2 2H7V7H2Z M9 2H14V7H9Z M2 9H7V14H2Z M9 9H14V14H9Z"/></svg>"#
+        }
+        Glyph::List => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M1 3H3V5H1Z M5 3H15V5H5Z M1 7H3V9H1Z M5 7H15V9H5Z M1 11H3V13H1Z M5 11H15V13H5Z"/></svg>"#
+        }
+        Glyph::Map => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M1 2H8V14H1Z M9 2H15V9H9Z M9 10H12V14H9Z M13 10H15V14H13Z"/></svg>"#
+        }
+        Glyph::Tidy => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M1 3H15V5H1Z M1 7H11V9H1Z M1 11H7V13H1Z"/></svg>"#
+        }
+        Glyph::Info => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M1 1H15V15H1Z M2.5 2.5V13.5H13.5V2.5Z"/><path d="M7 4H9V6H7Z M7 7H9V12H7Z"/></svg>"#
+        }
+        Glyph::Tick => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M2 8.5L4 6.5L6.5 9L12 3.5L14 5.5L6.5 13Z"/></svg>"#
+        }
+        Glyph::Dash => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3 7H13V9H3Z"/></svg>"#
+        }
+        Glyph::Shut => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M5 3L11 8L5 13Z"/></svg>"#
+        }
+        Glyph::Open => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3 5H13L8 11Z"/></svg>"#
+        }
+        Glyph::Arrow => {
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M1 7H10V4L15 8L10 12V9H1Z"/></svg>"#
+        }
+    };
+    widget::icon::from_svg_bytes(svg.as_bytes()).symbolic(true)
+}
+
+/// What a tick box holds: a tick, nothing, or a dash for a group with only some ticked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ticked {
+    On,
+    Off,
+    Some,
+}
+
+/// A 16px tick box: the one dark with a light tick or dash, or the plate with an ink frame when
+/// empty.
+///
+/// It acts on the mouse press; the keyboard works it through the panel's own cursor. The cursor
+/// (`ring`) or the focus draws a 1px ring of the one dark around it, 2px out from the box.
+pub fn tick<'a, M: Clone + 'a>(state: Ticked, press: M, ring: bool) -> Element<'a, M> {
+    // The box: the shadow tone with an ink edge when off, the one dark when on or partly on.
+    let tone = move |theme: &theme::Theme| {
+        let Some(t) = ladder() else {
+            let c = theme.cosmic();
+            return cosmic::iced::widget::container::Style {
+                background: Some(Background::Color(match state {
+                    Ticked::Off => c.button_bg_color().into(),
+                    _ => c.accent_color().into(),
+                })),
+                icon_color: Some(c.on_accent_color().into()),
+                ..Default::default()
+            };
+        };
+        let off = state == Ticked::Off;
+        cosmic::iced::widget::container::Style {
+            background: Some(Background::Color(if off { t.shadow() } else { t.accent() })),
+            border: cosmic::iced::Border {
+                color: t.text(),
+                width: if off { 1.0 } else { 0.0 },
+                radius: 0.0.into(),
+            },
+            icon_color: Some(t.light()),
+            ..Default::default()
+        }
+    };
+    let mark: Element<'a, M> = match state {
+        Ticked::On => widget::icon(glyph(Glyph::Tick)).size(12).into(),
+        Ticked::Some => widget::icon(glyph(Glyph::Dash)).size(12).into(),
+        Ticked::Off => widget::space::horizontal().width(12).height(12).into(),
+    };
+    let boxed = widget::container(mark)
+        .center(Length::Fixed(16.0))
+        .class(theme::Container::custom(tone));
+    // The button is the box plus a 3px frame; focus draws a 1px ring at its edge, a 2px gap
+    // from the box so it shows around a dark box too, and the ring never moves the box.
+    let cursor = ring;
+    let ring = move |focused: bool, theme: &theme::Theme| {
+        let mut s = widget::button::Style::new();
+        s.border_radius = 0.0.into();
+        if focused || cursor {
+            s.border_width = 1.0;
+            s.border_color = match ladder() {
+                Some(t) => t.accent(),
+                None => theme.cosmic().accent_color().into(),
+            };
+        }
+        s
+    };
+    widget::button::custom(boxed)
+        .padding(3)
+        .width(Length::Fixed(22.0))
+        .height(Length::Fixed(22.0))
+        .on_press_down(press)
+        .class(theme::Button::Custom {
+            active: Box::new(ring),
+            disabled: Box::new(move |theme| ring(false, theme)),
+            hovered: Box::new(ring),
+            pressed: Box::new(ring),
+        })
+        .into()
+}
+
+/// The `+12 more` latch under a short list: light ink on the secondary plate with a drop shadow.
+pub fn more<'a, M: Clone + 'a>(label: String, press: M) -> Element<'a, M> {
+    let look = |theme: &theme::Theme| {
+        let mut s = widget::button::Style::new();
+        s.border_radius = 0.0.into();
+        match ladder() {
+            Some(t) => {
+                s.background = Some(Background::Color(t.secondary()));
+                s.text_color = Some(t.light());
+            }
+            None => {
+                s.background = Some(Background::Color(theme.cosmic().button_bg_color().into()));
+                s.text_color = Some(theme.cosmic().on_bg_color().into());
+            }
+        }
+        s
+    };
+    let button = widget::button::custom(crate::palette::body(label))
+        .padding([0, 4])
+        .height(Length::Fixed(16.0))
+        .on_press(press)
+        .class(theme::Button::Custom {
+            active: Box::new(move |_, theme| look(theme)),
+            disabled: Box::new(move |theme| look(theme)),
+            hovered: Box::new(move |_, theme| look(theme)),
+            pressed: Box::new(move |_, theme| look(theme)),
+        });
+    // A button has no shadow tone of its own, so the plate's drop shadow sits on a frame.
+    widget::container(button)
+        .class(theme::Container::custom(|_| match ladder() {
+            Some(t) => container::Style {
+                shadow: Shadow {
+                    color: t.faint(),
+                    offset: Vector::new(2.0, 2.0),
+                    blur_radius: 0.0,
+                },
+                ..Default::default()
+            },
+            None => container::Style::default(),
+        }))
+        .into()
+}
+
+/// A press area with no look of its own: a chevron, or a header row to fold.
+pub fn flat<'a, M: Clone + 'a>(content: impl Into<Element<'a, M>>, press: M) -> widget::Button<'a, M> {
+    // Keyboard focus draws a 1px ink frame; nothing else changes.
+    let look = |focused: bool, _: &theme::Theme| {
+        let mut s = widget::button::Style::new();
+        s.border_radius = 0.0.into();
+        if let Some(t) = ladder() {
+            s.text_color = Some(t.text());
+            s.icon_color = Some(t.solid());
+            if focused {
+                s.border_width = 1.0;
+                s.border_color = t.text();
+            }
+        }
+        s
+    };
+    widget::button::custom(content)
+        .padding(0)
+        .on_press(press)
+        .class(theme::Button::Custom {
+            active: Box::new(look),
+            disabled: Box::new(move |theme| look(false, theme)),
+            hovered: Box::new(look),
+            pressed: Box::new(look),
+        })
+}
+
+/// An icon in the secondary ink, for marks that only show: the arrow in a row.
+pub fn quiet_icon<'a, M: 'a>(g: Glyph, size: u16) -> Element<'a, M> {
+    widget::container(widget::icon(glyph(g)).size(size))
+        .class(theme::Container::custom(|_| container::Style {
+            icon_color: ladder().map(|t| t.secondary()),
+            ..Default::default()
+        }))
+        .into()
+}
+
+/// A short name to edit inline, on a 16px line: ink on the plate tone, framed in ink while
+/// typing.
+pub fn name_field<'a, M: Clone + 'static>(
+    value: String,
+    on_input: impl Fn(String) -> M + 'a,
+) -> widget::TextInput<'a, M> {
+    let look = move |focused: bool, theme: &theme::Theme| {
+        let c = theme.cosmic();
+        let (ink, hint, fill, on_fill, well): (Color, Color, Color, Color, Color) = match ladder() {
+            Some(t) => (t.text(), t.secondary(), t.accent(), t.light(), t.shadow()),
+            None => (
+                c.on_bg_color().into(),
+                c.on_bg_color().into(),
+                c.accent_color().into(),
+                c.on_accent_color().into(),
+                c.button_bg_color().into(),
+            ),
+        };
+        widget::text_input::Appearance {
+            background: Background::Color(well),
+            border_radius: 0.0.into(),
+            border_offset: None,
+            border_width: if focused { 1.0 } else { 0.0 },
+            border_color: ink,
+            label_color: hint,
+            placeholder_color: hint,
+            selected_text_color: on_fill,
+            icon_color: Some(ink),
+            text_color: Some(ink),
+            selected_fill: fill,
+        }
+    };
+    widget::text_input("", value)
+        .on_input(on_input)
+        .style(theme::TextInput::Custom {
+            active: Box::new(move |theme| look(false, theme)),
+            error: Box::new(move |theme| look(false, theme)),
+            hovered: Box::new(move |theme| look(false, theme)),
+            focused: Box::new(move |theme| look(true, theme)),
+            disabled: Box::new(move |theme| look(false, theme)),
+        })
+        // The renderer's own default is COSMIC's sans; the window's text face is the font set.
+        .font(cosmic::font::default())
+        .size(12.0)
+        .line_height(cosmic::iced::widget::text::LineHeight::Absolute(16.0.into()))
+        .padding([0, 4])
+        .width(Length::Fill)
+}
+
+/// The search field's text: ink on the well, the hint in secondary ink, the selection in the
+/// one dark.
+fn field_style() -> theme::TextInput {
+    let look = |theme: &theme::Theme| {
+        let c = theme.cosmic();
+        let (ink, hint, fill, on_fill): (Color, Color, Color, Color) = match ladder() {
+            Some(t) => (t.text(), t.secondary(), t.accent(), t.light()),
+            None => (
+                c.on_bg_color().into(),
+                c.on_bg_color().into(),
+                c.accent_color().into(),
+                c.on_accent_color().into(),
+            ),
+        };
+        widget::text_input::Appearance {
+            background: Background::Color(Color::TRANSPARENT),
+            border_radius: 0.0.into(),
+            border_offset: None,
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+            label_color: hint,
+            placeholder_color: hint,
+            selected_text_color: on_fill,
+            icon_color: Some(ink),
+            text_color: Some(ink),
+            selected_fill: fill,
+        }
+    };
+    theme::TextInput::Custom {
+        active: Box::new(look),
+        error: Box::new(look),
+        hovered: Box::new(look),
+        focused: Box::new(look),
+        disabled: Box::new(look),
+    }
+}
+
+/// The search field on the top bar, always open: a well like the location's under the palette,
+/// COSMIC's search input otherwise. Without `on_input` it shows the term and takes no typing.
+pub fn search_field<'a, M: Clone + 'static>(
+    id: widget::Id,
+    placeholder: String,
+    term: &'a str,
+    on_input: Option<impl Fn(String) -> M + 'a>,
+    on_clear: M,
+) -> Element<'a, M> {
+    if ladder().is_none() {
+        let mut input = widget::text_input::search_input(placeholder, term)
+            .id(id)
+            .on_clear(on_clear)
+            .width(Length::Fixed(SEARCH_WIDTH));
+        if let Some(on_input) = on_input {
+            input = input.on_input(on_input);
+        }
+        return input.into();
+    }
+    let mut input = widget::text_input(placeholder, term)
+        .id(id)
+        .style(field_style())
+        // The renderer's own default is COSMIC's sans; the window's text face is the font set.
+        .font(cosmic::font::default())
+        .size(12.0)
+        .line_height(cosmic::iced::widget::text::LineHeight::Absolute(16.0.into()))
+        .padding([4, 0])
+        .width(Length::Fill);
+    if let Some(on_input) = on_input {
+        input = input.on_input(on_input);
+    }
+    widget::container(well("search", input.into()))
+        .width(Length::Fixed(SEARCH_WIDTH))
+        .into()
+}
+
 pub fn summary_id() -> widget::Id {
     widget::Id::new("ariadne-summary")
 }
@@ -522,6 +1048,7 @@ pub fn summary_editor<'a>(text: &str) -> Element<'a, Message> {
         "enter saves".to_string(),
         vec![
             widget::text_input("what lives here", text.to_string())
+                .font(cosmic::font::default())
                 .id(summary_id())
                 .on_input(Message::SummaryInput)
                 .on_submit(|_| Message::SummarySave)

@@ -76,6 +76,23 @@ pub fn ladder() -> Option<Tones> {
 
 pub fn clear() {
     *LADDER.write().unwrap() = None;
+    widget::menu::set_look(None);
+}
+
+/// Menus as the game's system message: the panel body under a header slab in the one dark, the
+/// row under the pointer in that dark with the cursor mark beside it, rules and keys quiet.
+fn menu_look(t: &Tones) -> widget::menu::Look {
+    widget::menu::Look {
+        panel: t.highlight(),
+        text: t.text(),
+        keys: t.secondary(),
+        rule: t.shadow(),
+        dark: t.accent(),
+        light: t.light(),
+        urgent: t.urgent(),
+        shadow: t.faint(),
+        cursor: t.solid(),
+    }
 }
 
 impl Tones {
@@ -216,6 +233,7 @@ pub fn secondary() -> theme::Text {
 
 /// A button that does the thing: the panel tone with an ink border, the one dark while pressed.
 /// `quiet` is the button beside it (Keep, Skip, Not now): no plate, the border shows on hover.
+/// With nothing to do, its words and border go to the disabled tone.
 pub fn button(quiet: bool) -> theme::Button {
     let look = move |hovered: bool, pressed: bool, theme: &theme::Theme| {
         let mut s = widget::button::Style::new();
@@ -243,11 +261,30 @@ pub fn button(quiet: bool) -> theme::Button {
         }
         s
     };
+    let idle = move |theme: &theme::Theme| {
+        let mut s = look(false, false, theme);
+        if let Some(t) = ladder() {
+            s.text_color = Some(t.dim());
+            s.icon_color = Some(t.dim());
+            if !quiet {
+                s.border_color = t.dim();
+            }
+        }
+        s
+    };
+    // Keyboard focus thickens the edge to 2px of ink, on the quiet ones too.
+    let ring = move |mut s: widget::button::Style, focused: bool| {
+        if focused && let Some(t) = ladder() {
+            s.border_width = 2.0;
+            s.border_color = t.text();
+        }
+        s
+    };
     theme::Button::Custom {
-        active: Box::new(move |_, theme| look(false, false, theme)),
-        disabled: Box::new(move |theme| look(false, false, theme)),
-        hovered: Box::new(move |_, theme| look(true, false, theme)),
-        pressed: Box::new(move |_, theme| look(true, true, theme)),
+        active: Box::new(move |focused, theme| ring(look(false, false, theme), focused)),
+        disabled: Box::new(idle),
+        hovered: Box::new(move |focused, theme| ring(look(true, false, theme), focused)),
+        pressed: Box::new(move |focused, theme| ring(look(true, true, theme), focused)),
     }
 }
 
@@ -464,6 +501,14 @@ pub fn theme(path: &Path) -> Option<theme::Theme> {
         container.divider = t.shadow;
         container.small_widget = t.shadow;
         plate(&mut container.component, &t, t.shadow, t.text);
+        if key.ends_with("background") {
+            // Dropdown lists draw with this one (menus have their own look): a panel body framed
+            // in ink, the row under the pointer a plate. With both left at the plate tone a list
+            // read as one flat slab.
+            container.component.base = t.highlight;
+            container.component.hover = t.shadow;
+            container.component.divider = t.text;
+        }
         value[key] = serde_json::to_value(container).ok()?;
     }
     let c: cosmic::cosmic_theme::Theme = serde_json::from_value(value)
@@ -472,6 +517,7 @@ pub fn theme(path: &Path) -> Option<theme::Theme> {
 
     let mut theme = theme::Theme::custom(Arc::new(c));
     theme.theme_type.prefer_dark(Some(false));
+    widget::menu::set_look(Some(menu_look(&t)));
     *LADDER.write().unwrap() = Some(t);
     Some(theme)
 }

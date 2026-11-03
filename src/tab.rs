@@ -5921,6 +5921,16 @@ impl Tab {
         fn text_width_heading(content: &str) -> f32 {
             text_width(content, font::semibold(), 14.0, 20.0)
         }
+        /// The current place: COSMIC's heading, the body size without bold under the palette.
+        fn place_text<'a>(
+            name: impl Into<std::borrow::Cow<'a, str>> + 'a,
+        ) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
+            if crate::palette::ladder().is_some() {
+                crate::palette::body(name)
+            } else {
+                widget::text::heading(name)
+            }
+        }
 
         let cosmic_theme::Spacing {
             space_xxxs,
@@ -5935,30 +5945,8 @@ impl Tab {
         let mut row = widget::row::with_capacity(5)
             .align_y(Alignment::Center)
             .padding([space_xxxs, 0]);
+        // Back and forward live on the top bar; the crumbs start the row.
         let mut w = 0.0;
-
-        let mut prev_button =
-            widget::button::custom(widget::icon::from_name("go-previous-symbolic").size(16))
-                .padding(space_xxs)
-                .class(theme::Button::Icon);
-        if self.history_i > 0 && !self.history.is_empty() {
-            prev_button = prev_button.on_press(Message::GoPrevious);
-        }
-        row = row.push(prev_button);
-        w += f32::from(space_xxs).mul_add(2.0, 16.0);
-
-        let mut next_button =
-            widget::button::custom(widget::icon::from_name("go-next-symbolic").size(16))
-                .padding(space_xxs)
-                .class(theme::Button::Icon);
-        if self.history_i + 1 < self.history.len() {
-            next_button = next_button.on_press(Message::GoNext);
-        }
-        row = row.push(next_button);
-        w += f32::from(space_xxs).mul_add(2.0, 16.0);
-
-        row = row.push(widget::space::horizontal().width(Length::Fixed(space_s.into())));
-        w += f32::from(space_s);
 
         //TODO: allow resizing?
         let name_width = 300.0;
@@ -6109,18 +6097,8 @@ impl Tab {
                 }
                 return column.into();
             }
-        } else if let Some(path) = self.location.path_opt() {
-            row = row.push(
-                crate::mouse_area::MouseArea::new(
-                    widget::button::custom(widget::icon::from_name("edit-symbolic").size(16))
-                        .padding(space_xxs)
-                        .class(theme::Button::Icon)
-                        .on_press(Message::EditLocation(Some(self.location.clone().into()))),
-                )
-                .on_middle_press(move |_| Message::OpenInNewTab(path.clone())),
-            );
-            w += f32::from(space_xxs).mul_add(2.0, 16.0);
         }
+        // No edit button: pressing the last crumb edits the location.
 
         let mut children: Vec<Element<_>> = Vec::new();
         match &self.location {
@@ -6134,7 +6112,7 @@ impl Tab {
                     let (name_width, name_text) = if children.is_empty() {
                         (
                             text_width_heading(&name),
-                            widget::text::heading(name)
+                            place_text(name)
                                 .wrapping(text::Wrapping::None)
                                 .ellipsize(text::Ellipsize::End(
                                     text::EllipsizeHeightLimit::Lines(1),
@@ -6213,7 +6191,7 @@ impl Tab {
             }
             Location::Trash | Location::Search(SearchLocation::Trash, ..) => {
                 children.push(
-                    widget::button::custom(widget::text::heading(fl!("trash")))
+                    widget::button::custom(place_text(fl!("trash")))
                         .padding(space_xxxs)
                         .on_press(Message::Location(Location::Trash))
                         .class(theme::Button::Text)
@@ -6222,7 +6200,7 @@ impl Tab {
             }
             Location::Recents | Location::Search(SearchLocation::Recents, ..) => {
                 children.push(
-                    widget::button::custom(widget::text::heading(fl!("recents")))
+                    widget::button::custom(place_text(fl!("recents")))
                         .padding(space_xxxs)
                         .on_press(Message::Location(Location::Recents))
                         .class(theme::Button::Text)
@@ -6231,7 +6209,7 @@ impl Tab {
             }
             Location::Inbox => {
                 children.push(
-                    widget::button::custom(widget::text::heading(fl!("inbox")))
+                    widget::button::custom(place_text(fl!("inbox")))
                         .padding(space_xxxs)
                         .on_press(Message::Location(Location::Inbox))
                         .class(theme::Button::Text)
@@ -6240,7 +6218,7 @@ impl Tab {
             }
             Location::Network(uri, display_name, path) => {
                 children.push(
-                    widget::button::custom(widget::text::heading(display_name))
+                    widget::button::custom(place_text(display_name))
                         .padding(space_xxxs)
                         .on_press(Message::Location(Location::Network(
                             uri.clone(),
@@ -7511,7 +7489,7 @@ impl Tab {
         // Under the palette theme the items share the width with the detail panel.
         let sheet = crate::palette::ladder().is_some() && !matches!(self.mode, Mode::Desktop);
         // A page beside the items (Tidy, Settings) takes the detail panel's place.
-        let detail = sheet && size.width > 900.0 && self.map.is_none() && !crate::ariadne::side_open();
+        let detail = sheet && size.width > 900.0 && self.map.is_none() && !crate::ariadne::detail_hidden();
         let items_size = if detail {
             Size::new(size.width - DETAIL_WIDTH - 10.0, size.height)
         } else {

@@ -160,6 +160,11 @@ pub fn title_lockup<'a, M: 'a>(word: &str, sub: &str) -> Element<'a, M> {
 }
 
 fn tracked<'a, M: 'a>(text: &str, size: f32, track: f32, tone: Tone, ghost: bool) -> Element<'a, M> {
+    // Fluent wraps every argument in bidi isolates; each would take a cell of its own here.
+    let text: String = text
+        .chars()
+        .filter(|c| !('\u{2066}'..='\u{2069}').contains(c))
+        .collect();
     let font = cosmic::font::default();
     let advance = advance(font) * size;
     let gap = size * track;
@@ -170,7 +175,6 @@ fn tracked<'a, M: 'a>(text: &str, size: f32, track: f32, tone: Tone, ghost: bool
         0.0
     };
     let height = (size * LEADING).round();
-    let text = text.to_string();
     ink(
         move |t| Paint::Caps {
             text,

@@ -73,6 +73,8 @@ pub fn key_binds(mode: &tab::Mode) -> HashMap<KeyBind, Action> {
     if matches!(mode, tab::Mode::App | tab::Mode::Desktop) {
         bind!([Ctrl], Key::Character("c".into()), Copy);
         bind!([Ctrl, Shift], Key::Character("c".into()), CopyPath);
+        // Organize the selection: free in this app and in COSMIC's own shortcuts.
+        bind!([Ctrl, Shift], Key::Character("o".into()), Organize);
         bind!([Ctrl], Key::Character("x".into()), Cut);
         bind!([Ctrl], Key::Character("z".into()), AriadneUndo);
         // a plain N would steal the letter from type-to-search

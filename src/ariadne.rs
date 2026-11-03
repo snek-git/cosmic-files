@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const ADDR: &str = "127.0.0.1:8199";
 const RESULTS: usize = 40;
 
 #[derive(Deserialize)]
@@ -90,6 +89,16 @@ pub struct Activity {
     pub line: String,
     #[serde(default)]
     pub busy: bool,
+    /// How far an Organize plan has got, while one runs.
+    #[serde(default)]
+    pub planning: Option<Progress>,
+}
+
+/// Files planned so far, out of all of them.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+pub struct Progress {
+    pub done: usize,
+    pub total: usize,
 }
 
 /// Everything the window shows from the daemon, refetched when its version moves.
@@ -297,15 +306,36 @@ pub fn set_tidy_open(open: bool) {
     TIDY_OPEN.store(open, std::sync::atomic::Ordering::Relaxed);
 }
 
-static SIDE_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DETAIL_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether a page (Tidy, Settings) stands beside the items, as the window last drew it.
-pub fn side_open() -> bool {
-    SIDE_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+/// Whether the detail panel is off: put away from the top bar, or a page (Tidy, Settings) stands
+/// in its place, as the window last drew it.
+pub fn detail_hidden() -> bool {
+    DETAIL_HIDDEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub fn set_side_open(open: bool) {
-    SIDE_OPEN.store(open, std::sync::atomic::Ordering::Relaxed);
+pub fn set_detail_hidden(hidden: bool) {
+    DETAIL_HIDDEN.store(hidden, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Start the daemon when it is down, so opening the window is all it takes. `ariadne up` names
+/// its unit, so two windows racing here start it once. Found in ~/.local/bin by path, since
+/// windows started over D-Bus do not have it on PATH.
+pub fn ensure_running() {
+    if activity().is_some() {
+        return;
+    }
+    let cli = dirs::executable_dir()
+        .map(|dir| dir.join("ariadne"))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("ariadne"));
+    match std::process::Command::new(cli).arg("up").output() {
+        Ok(out) if !out.status.success() => {
+            log::warn!("ariadne up: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(_) => {}
+        Err(err) => log::warn!("ariadne up: {err}"),
+    }
 }
 
 /// The inbox and the thread, or None when the daemon is down.
@@ -442,10 +472,20 @@ fn encode(s: &str) -> String {
 }
 
 fn request(head: &str, body: &str) -> Option<String> {
-    let addr: SocketAddr = ADDR.parse().ok()?;
+    request_within(head, body, Duration::from_secs(15))
+}
+
+/// The daemon's address; ARIADNE_PORT points the app at a sandbox daemon beside the real one.
+fn addr() -> SocketAddr {
+    let port = std::env::var("ARIADNE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8199);
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+fn request_within(head: &str, body: &str, wait: Duration) -> Option<String> {
+    let addr = addr();
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(150)).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
-    write!(s, "{head} HTTP/1.0\r\nHost: {ADDR}\r\n").ok()?;
+    s.set_read_timeout(Some(wait)).ok()?;
+    write!(s, "{head} HTTP/1.0\r\nHost: {addr}\r\n").ok()?;
     if !body.is_empty() {
         write!(s, "Content-Type: application/json\r\nContent-Length: {}\r\n", body.len()).ok()?;
     }
@@ -594,13 +634,193 @@ pub fn overlays(proposals: &[Proposal]) -> Vec<crate::map::Overlay> {
         .collect()
 }
 
-/// Undo the newest move on the thread.
-pub fn undo_last() -> bool {
-    request("POST /undo", "{}").is_some()
+/// What an undo put back. An Organize comes back whole, so `count` can be many files.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Undone {
+    pub count: usize,
+    /// The Organize it took back, when the move undone was part of one.
+    #[serde(default)]
+    pub batch: Option<String>,
+}
+
+/// Undo one move by where it landed, else the newest move on the thread. Either way a move
+/// made by an Organize brings back its whole batch.
+pub fn undo(path: Option<&Path>) -> Option<Undone> {
+    let body = match path {
+        Some(path) => serde_json::json!({ "path": path }),
+        None => serde_json::json!({}),
+    };
+    serde_json::from_str(&request("POST /undo", &body.to_string())?).ok()
+}
+
+/// A file Organize leaves where it is, and why: already there, an empty file, no real guess.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Left {
+    pub path: PathBuf,
+    pub why: String,
+    /// Other folders the daemon would consider for it, best first, for Send to.
+    #[serde(default)]
+    pub alternatives: Vec<PathBuf>,
+}
+
+/// One file in an Organize plan: ticked when the daemon is sure, and the note to show beside it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PlanFile {
+    pub path: PathBuf,
+    /// The folder it sits in now.
+    pub from: PathBuf,
+    pub ticked: bool,
+    pub share: Option<f32>,
+    #[serde(default)]
+    pub note: String,
+    /// Other folders the daemon would consider for it, best first, for Send to.
+    #[serde(default)]
+    pub alternatives: Vec<PathBuf>,
+    /// The daemon's own tick, kept while the user changes `ticked`: a pre-ticked row the user
+    /// unticks is a "no" the daemon remembers; a row it never ticked is not.
+    #[serde(skip)]
+    pub pre: bool,
+}
+
+impl PlanFile {
+    /// The user said no to this row: the plan ticked it and the user took the tick off.
+    pub fn declined(&self) -> bool {
+        self.pre && !self.ticked
+    }
+}
+
+/// The files that would go to one folder. `new` when the folder does not exist yet; `proposed`
+/// is the daemon's own folder, sent back unchanged when the user renames a new one.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PlanGroup {
+    pub folder: PathBuf,
+    pub proposed: PathBuf,
+    pub new: bool,
+    #[serde(default)]
+    pub why: String,
+    /// What Move does for this group, in one sentence, counting the files the daemon ticked.
+    pub summary: String,
+    pub files: Vec<PlanFile>,
+    /// The group goes along when a folder above it is renamed, as the daemon places it. False
+    /// when the user said to keep it where it was planned.
+    #[serde(skip, default = "along")]
+    pub carry: bool,
+}
+
+fn along() -> bool {
+    true
+}
+
+/// Where Organize would put the picked files, and the files it would leave.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Plan {
+    pub groups: Vec<PlanGroup>,
+    #[serde(default)]
+    pub left: Vec<Left>,
+    /// Copies the user marked for the trash, which go in the Move's batch.
+    #[serde(skip)]
+    pub trash: Vec<PathBuf>,
+}
+
+/// What a plan did: the moves, which undo together as its batch, the copies it trashed, and
+/// the files it left.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Applied {
+    pub batch: String,
+    pub moved: Vec<Move>,
+    #[serde(default)]
+    pub trashed: Vec<PathBuf>,
+    pub left: Vec<Left>,
+}
+
+/// Each file may wait on the embedder and on a remote model, so planning gets minutes.
+const ORGANIZE_WAIT: Duration = Duration::from_secs(600);
+
+/// Ask where the picked files would go. Nothing moves; a folder means the files loose in it.
+pub fn plan(paths: &[PathBuf]) -> Option<Plan> {
+    let body = serde_json::json!({ "paths": paths }).to_string();
+    serde_json::from_str(&request_within("POST /organize/plan", &body, ORGANIZE_WAIT)?).ok()
+}
+
+/// Move the ticked files of a plan as one batch; unticked ones are remembered as rejected.
+pub fn apply_plan(plan: &Plan) -> Option<Applied> {
+    let body = apply_body(plan).to_string();
+    serde_json::from_str(&request_within("POST /organize/apply", &body, ORGANIZE_WAIT)?).ok()
+}
+
+/// The apply request for a plan as the panel holds it: only what the contract asks for.
+pub fn apply_body(plan: &Plan) -> serde_json::Value {
+    // A group every file was sent away from has nothing to say.
+    let groups: Vec<_> = plan
+        .groups
+        .iter()
+        .filter(|g| !g.files.is_empty())
+        .map(|g| {
+            let files: Vec<_> = g
+                .files
+                .iter()
+                .map(|f| {
+                    let mut file = serde_json::json!({ "path": f.path, "ticked": f.ticked });
+                    // Only a row the user unticked from ticked carries the flag, never false.
+                    if f.declined() {
+                        file["declined"] = serde_json::Value::Bool(true);
+                    }
+                    file
+                })
+                .collect();
+            let mut group = serde_json::json!({
+                "folder": g.folder,
+                "proposed": g.proposed,
+                "new": g.new,
+                "files": files,
+            });
+            // Only a group kept out of a renamed folder above it says so.
+            if !g.carry {
+                group["carry"] = serde_json::Value::Bool(false);
+            }
+            group
+        })
+        .collect();
+    let mut body = serde_json::json!({ "groups": groups });
+    if !plan.trash.is_empty() {
+        body["trash"] = serde_json::json!(plan.trash);
+    }
+    body
+}
+
+/// Put back every move of one Organize.
+pub fn undo_batch(batch: &str) -> Option<Undone> {
+    let body = serde_json::json!({ "batch": batch }).to_string();
+    serde_json::from_str(&request("POST /undo", &body)?).ok()
 }
 
 /// Move a waiting file to a folder the user picked instead of the suggestion.
 pub fn move_to(path: &Path, folder: &Path) -> bool {
     let body = serde_json::json!({ "path": path, "folder": folder }).to_string();
     request("POST /accept", &body).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_undo_reply_counts_the_files_back() {
+        let reply = r#"{"undone": [{"from": "/a", "to": "/b"}], "count": 138, "batch": "organize-1"}"#;
+        let undone: Undone = serde_json::from_str(reply).unwrap();
+        assert_eq!(undone.count, 138);
+        let none: Undone = serde_json::from_str(r#"{"undone": [], "count": 0, "batch": null}"#).unwrap();
+        assert_eq!(none.count, 0);
+    }
+
+    #[test]
+    fn activity_carries_plan_progress_while_a_plan_runs() {
+        let busy: Activity = serde_json::from_str(
+            r#"{"line": "planning 120 of 246", "busy": true, "planning": {"done": 120, "total": 246}}"#,
+        )
+        .unwrap();
+        assert_eq!(busy.planning, Some(Progress { done: 120, total: 246 }));
+        let idle: Activity = serde_json::from_str(r#"{"line": "up to date", "busy": false, "planning": null}"#).unwrap();
+        assert_eq!(idle.planning, None);
+    }
 }

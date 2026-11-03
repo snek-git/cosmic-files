@@ -54,8 +54,13 @@ pub fn context_menu(
     clipboard_paste_available: bool,
     context_actions: &[ContextActionPreset],
 ) -> Vec<menu::Tree<tab::Message>> {
-    let menu_item =
-        |label: String, action: Action| menu::Item::Button(label, None, TabAction(action));
+    let menu_item = |label: String, action: Action| match action {
+        // the destructive entries draw in the urgent tone under the palette's menu look
+        Action::Delete | Action::PermanentlyDelete | Action::EmptyTrash => {
+            menu::Item::Entry(menu::Entry::new(label, TabAction(action)).urgent())
+        }
+        _ => menu::Item::Button(label, None, TabAction(action)),
+    };
     let menu_item_disabled =
         |label: String, action: Action| menu::Item::ButtonDisabled(label, None, TabAction(action));
 
@@ -84,10 +89,12 @@ pub fn context_menu(
     let mut selected_types: Vec<Mime> = vec![];
     let mut selected_mount_point = 0;
     let mut any_trash_item = false;
+    let mut selected_name = None;
     if let Some(items) = tab.items_opt() {
         for item in items {
             if item.selected {
                 selected += 1;
+                selected_name = Some(item.display_name.as_str());
                 if item.metadata.is_dir() {
                     selected_mount_point += i32::from(item.is_mount_point);
                     selected_dir += 1;
@@ -228,6 +235,9 @@ pub fn context_menu(
                     children.push(menu_item(fl!("move-to"), Action::MoveTo));
                 }
                 children.push(menu_item(fl!("copy-to"), Action::CopyTo));
+                // ariadne plans where the files go, a folder's loose files included; nothing
+                // moves until the plan's Move.
+                children.push(menu_item(fl!("organize"), Action::Organize));
 
                 children.push(menu::Item::Divider);
                 let supported_archive_types = crate::archive::SUPPORTED_ARCHIVE_TYPES;
@@ -408,7 +418,18 @@ pub fn context_menu(
         .iter()
         .map(|(key_bind, action)| (key_bind.clone(), TabAction(*action)))
         .collect();
-    menu::items(&key_binds, children)
+    // Under the palette the menu opens on a header naming what it acts on
+    let mut trees = Vec::new();
+    if crate::palette::ladder().is_some() {
+        let name = match (selected, selected_name) {
+            (1, Some(name)) => name.to_string(),
+            (0, _) => tab.title(),
+            (n, _) => format!("{n} items"),
+        };
+        trees.push(menu::header(&name));
+    }
+    trees.extend(menu::items(&key_binds, children));
+    trees
 }
 
 pub fn dialog_menu(

@@ -74,6 +74,7 @@ use crate::operation::{
     Controller, Operation, OperationError, OperationErrorType, OperationSelection, ReplaceResult,
     copy_unique_path,
 };
+use crate::places::Section;
 use crate::spawn_detached::spawn_detached;
 use crate::tab::{
     self, HOVER_DURATION, HeadingOptions, ItemMetadata, Location, SORT_OPTION_FALLBACK,
@@ -161,6 +162,7 @@ pub enum Action {
     LocationUp,
     MoveTo,
     FindSimilar,
+    Organize,
     AriadneUndo,
     AriadneNext,
     EditSummary,
@@ -241,6 +243,7 @@ impl Action {
             Self::LocationUp => Message::TabMessage(entity_opt, tab::Message::LocationUp),
             Self::MoveTo => Message::MoveTo(entity_opt),
             Self::FindSimilar => Message::FindSimilar(entity_opt),
+            Self::Organize => Message::Organize(entity_opt),
             Self::AriadneUndo => Message::AriadneUndo(None),
             Self::AriadneNext => Message::TabMessage(entity_opt, tab::Message::AriadneNext),
             Self::EditSummary => Message::TabMessage(entity_opt, tab::Message::SummaryEdit),
@@ -342,6 +345,8 @@ impl MenuAction for NavMenuAction {
 
 /// The Tidy panel's width: the detail panel's, so the sheet keeps its shape when it opens.
 const TIDY_WIDTH: f32 = 360.0;
+/// How long the toast after an Organize stays, with its Undo.
+const ORGANIZE_TOAST: std::time::Duration = std::time::Duration::from_secs(30);
 /// Settings needs room for a path field beside its label.
 const SETTINGS_WIDTH: f32 = 480.0;
 
@@ -421,6 +426,62 @@ pub enum Message {
     OpenInNewWindow(Option<Entity>),
     OpenItemLocation(Option<Entity>),
     FindSimilar(Option<Entity>),
+    /// Organize: ask for a plan for the picked items, which opens the panel at once.
+    Organize(Option<Entity>),
+    /// The plan came back for the ask with this number (and whether a picked folder had folders
+    /// in it), or the daemon could not plan.
+    OrganizePlanned(u64, Option<crate::ariadne::Plan>, bool),
+    /// Start the Organize these paths ask for, once nothing unsaved stands in the way.
+    OrganizeStart(Vec<PathBuf>),
+    /// Close the panel, asking first when the plan has edits.
+    OrganizeClose,
+    /// The answer to "Discard changes?": true discards and goes on.
+    OrganizeDiscard(bool),
+    /// Open or close the Send to list of a file or a card.
+    OrganizeSendMenu(Option<crate::organize::Sending>),
+    /// Send a file or a card to a folder.
+    OrganizeSendTo(crate::organize::Sending, PathBuf),
+    /// Pick any folder for a file or a card in the folder picker, and the picker's answer.
+    OrganizeBrowse(crate::organize::Sending),
+    OrganizeSent(DialogResult),
+    /// Mark a staying copy for the trash with the Move, or take the mark back.
+    OrganizeTrash(PathBuf),
+    /// Ctrl+Z in a text box of a window.
+    UndoKey(WindowId),
+    /// The answer to "Also move papers/cv to invoice/cv?" on a card.
+    OrganizeCarry(usize, bool),
+    /// Take back the rename that joined a card to another folder.
+    OrganizeUnrename(usize),
+    /// Show a file of the plan in the view.
+    OrganizeReveal(PathBuf),
+    /// The sheet's filter on file names, destinations and reasons.
+    OrganizeFilter(String),
+    /// A key for the panel's cursor while a plan is up.
+    OrganizeKey(crate::organize::PanelKey),
+    /// Ctrl+Enter in a window: Move, when that window shows a plan.
+    OrganizeCommit(WindowId),
+    /// Tick or untick a file: group, file, ticked.
+    OrganizeTick(usize, usize, bool),
+    /// Tick or untick every file of a card, by its lead group.
+    OrganizeTickGroup(usize, bool),
+    /// Rename a card's new folder: lead group, its new last part.
+    OrganizeName(usize, String),
+    /// Enter in a name field: done naming, the keyboard goes back to the cursor.
+    OrganizeNamed,
+    /// Open or close a card or a group.
+    OrganizeFold(crate::organize::Fold),
+    /// Open or close the wide sheet with every file.
+    OrganizeSheet(bool),
+    /// A tab: scroll the panel's list to that part.
+    OrganizeTab(usize),
+    OrganizeScrolled(f32),
+    /// A second passed while the plan is on its way: redraw the count.
+    OrganizeClock,
+    /// Where the panel's three parts and its cursor sit in its list.
+    OrganizeSections(crate::organize::Measured),
+    OrganizeMove,
+    OrganizeMoved(Option<crate::ariadne::Applied>),
+    OrganizeUndo(widget::ToastId, String),
     OpenWithBrowse,
     OpenWithDialog(Option<Entity>),
     OpenWithSelection(usize),
@@ -517,6 +578,8 @@ pub enum Message {
     TabView(Option<Entity>, tab::View),
     TimeConfigChange(TimeConfig),
     ToggleContextPage(ContextPage),
+    /// Shows or puts away the detail panel beside the items, under the palette.
+    ToggleDetail,
     ToggleFoldersFirst,
     ToggleShowHidden,
     Undo(usize),
@@ -555,6 +618,8 @@ pub enum ContextPage {
     Settings,
     /// Every change ariadne would make, spelled out, one button each.
     Tidy,
+    /// Where Organize would put the picked items, to tick, rename and move.
+    Organize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -690,6 +755,15 @@ impl DialogPages {
     }
 
     pub fn push_back(&mut self, page: DialogPage) -> Task<Message> {
+        // A second Delete while one already asks would stack the same question over it.
+        if matches!(page, DialogPage::PermanentlyDelete { .. } | DialogPage::DeleteTrash { .. })
+            && self
+                .pages
+                .iter()
+                .any(|p| std::mem::discriminant(p) == std::mem::discriminant(&page))
+        {
+            return Task::none();
+        }
         let task = if self.pages.is_empty() {
             Task::done(cosmic::Action::App(Message::DesktopDialogs(true)))
         } else {
@@ -724,6 +798,24 @@ impl DialogPages {
         if !self.pages.is_empty() {
             self.pages[0] = page;
         }
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::*;
+
+    #[test]
+    fn a_second_delete_question_does_not_stack_and_one_escape_closes_it() {
+        let mut pages = DialogPages::new();
+        let ask = || DialogPage::PermanentlyDelete {
+            paths: vec![PathBuf::from("/gone")].into_boxed_slice(),
+        };
+        for _ in 0..38 {
+            let _ = pages.push_back(ask());
+        }
+        assert!(pages.pop_front().is_some());
+        assert!(pages.front().is_none());
     }
 }
 
@@ -828,6 +920,8 @@ pub struct App {
     nav_dnd_hover: Option<(Location, Instant)>,
     /// ariadne suggestions waiting in the Inbox, shown next to its sidebar entry.
     inbox_count: usize,
+    /// The detail panel put away from the top bar, for this run.
+    detail_hidden: bool,
     /// The palette file path as typed in Settings, saved on Enter.
     palette_input: String,
     font_input: String,
@@ -835,14 +929,22 @@ pub struct App {
     /// The status line, and how much of it is typed out so far.
     status: crate::ariadne::Activity,
     status_shown: usize,
+    /// A line the status keeps saying until a moment, over the daemon's own: what an Organize
+    /// did, for as long as its toast is up.
+    status_hold: Option<(String, Instant)>,
+    /// The last Organize's toast and its batch, taken down when that batch is undone elsewhere.
+    organize_toast: Option<(widget::ToastId, String)>,
     /// The knot whose card is open.
     knot_card: Option<u64>,
     /// New folder names edited in the Tidy list, by proposal id.
     tidy_names: HashMap<String, String>,
+    organize: crate::organize::Organize,
     tab_dnd_hover: Option<(Entity, Instant)>,
     type_select_prefix: String,
     type_select_last_key: Option<Instant>,
     nav_drag_id: DragId,
+    /// The places panel's sections, drawn from `nav_model`.
+    nav_groups: Vec<crate::places::Group>,
     tab_drag_id: DragId,
     auto_scroll_speed: Option<i16>,
     file_dialog_opt: Option<Dialog<Message>>,
@@ -1310,6 +1412,8 @@ impl App {
             //TODO: is there a smarter way to check this? (like checking for trash folders)
             let can_trash = match path.metadata() {
                 Ok(metadata) => matches!(tab::fs_kind(&metadata), tab::FsKind::Local),
+                // Already gone (trashed a moment ago, still selected): nothing to delete.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     log::warn!("failed to get metadata for {}: {}", path.display(), err);
                     false
@@ -1638,6 +1742,86 @@ impl App {
         Task::batch(commands)
     }
 
+    /// The Organize panel is the side page on screen.
+    fn organize_open(&self) -> bool {
+        self.core.window.show_context && self.context_page == ContextPage::Organize
+    }
+
+    /// Show a file in the active tab: select it where it is, going to its folder first when the
+    /// tab is elsewhere.
+    fn reveal(&mut self, path: PathBuf) -> Task<Message> {
+        let Some(parent) = path.parent().map(Path::to_path_buf) else {
+            return Task::none();
+        };
+        let entity = self.tab_model.active();
+        let location = Location::Path(parent);
+        let Some(tab) = self.tab_model.data_mut::<Tab>(entity) else {
+            return Task::none();
+        };
+        if tab.location != location {
+            tab.change_location(&location, None);
+            let title = tab.title();
+            self.activate_nav_model_location(&location);
+            self.tab_model.text_set(entity, title);
+            return Task::batch([
+                self.update_title(),
+                self.update_watcher(),
+                self.update_tab(entity, location, Some(vec![path])),
+            ]);
+        }
+        tab.select_paths(vec![path]);
+        Task::done(cosmic::action::app(Message::TabMessage(
+            Some(entity),
+            tab::Message::ScrollToFocused,
+        )))
+    }
+
+    /// Read every tab again after files moved under it: a folder's item count changes when its
+    /// files leave, and no watcher on the open folder sees that. Selections are kept.
+    fn rescan_tabs(&mut self) -> Task<Message> {
+        let tabs: Box<[_]> = self
+            .tab_model
+            .iter()
+            .filter_map(|entity| {
+                let tab = self.tab_model.data::<Tab>(entity)?;
+                Some((entity, tab.location.clone()))
+            })
+            .collect();
+        Task::batch(
+            tabs.into_iter()
+                .map(|(entity, location)| self.update_tab(entity, location, None)),
+        )
+    }
+
+    /// After an undo: how many files came back (a whole Organize comes back at once), and every
+    /// tab read again, since their counts changed.
+    /// `batch` is the Organize a toast's Undo asked for; None is Ctrl+Z or a knot's Undo.
+    fn undone(&mut self, undone: Option<crate::ariadne::Undone>, batch: Option<&str>) -> Task<Message> {
+        self.refresh_ariadne();
+        // The daemon's own line says what came back.
+        self.status_hold = None;
+        // That Organize's toast offers an Undo that has nothing left to do.
+        let gone = undone.as_ref().and_then(|u| u.batch.as_deref()).or(batch);
+        if let Some((id, toast_batch)) = &self.organize_toast
+            && gone == Some(toast_batch.as_str())
+        {
+            self.toasts.remove(*id);
+            self.organize_toast = None;
+        }
+        let note = match undone {
+            None => fl!("undo-failed"),
+            Some(u) if u.count == 0 && batch.is_some() => fl!("undo-already"),
+            Some(u) if u.count == 0 => fl!("undo-nothing"),
+            Some(u) => fl!("undo-put-back", n = u.count),
+        };
+        Task::batch([
+            self.rescan_tabs(),
+            self.toasts
+                .push(widget::toaster::Toast::new(note))
+                .map(cosmic::Action::App),
+        ])
+    }
+
     /// Refetch what the daemon knows right after acting, instead of waiting for the next poll.
     fn refresh_ariadne(&mut self) {
         if let Some(snapshot) = crate::ariadne::fetch() {
@@ -1701,6 +1885,7 @@ impl App {
             if p.kind == "group" {
                 lines = lines.push(
                     widget::text_input("", self.tidy_name(&p.id).unwrap_or_default())
+                        .font(cosmic::font::default())
                         .on_input(move |name| Message::TidyName(id.clone(), name))
                         .width(Length::Fill),
                 );
@@ -1791,6 +1976,9 @@ impl App {
         }
         match self.context_page {
             ContextPage::Tidy => Some(self.tidy_panel()),
+            // The sheet with every file stands in for the panel while it is open.
+            ContextPage::Organize if self.organize.sheet => None,
+            ContextPage::Organize => Some(self.organize.panel(TIDY_WIDTH)),
             ContextPage::Settings => Some(self.side_panel(
                 ContextPage::Settings,
                 &fl!("settings"),
@@ -1803,20 +1991,21 @@ impl App {
         }
     }
 
-    /// The sidebar under the palette theme: a panel with a header slab, places as plates, the
-    /// current one in the one dark. The same parts as COSMIC's nav bar, so drops, the context
-    /// menu, middle click and eject all still work.
+    /// The sidebar under the palette theme: Finder's sections, each a header slab over its
+    /// places as plates, the current one in the one dark, Trash at the foot. The same parts as
+    /// COSMIC's nav bar, so drops, the context menu, middle click and eject all still work: each
+    /// section hands its clicks back as the app's own entities.
     fn places(&self) -> Option<Element<'_, Message>> {
         if !self.core.nav_bar_active() {
             return None;
         }
-        let nav_model = self.nav_model()?;
         use cosmic::widget::menu::Item;
-        let items = self
-            .nav_menu_items()
-            .into_iter()
-            .map(|entries| {
-                entries
+        let mut menus: HashMap<Entity, Vec<Item<Place, String>>> = self
+            .nav_model
+            .iter()
+            .zip(self.nav_menu_items())
+            .map(|(entity, entries)| {
+                let entries = entries
                     .into_iter()
                     .filter_map(|entry| match entry {
                         Item::Button(label, icon, action) => {
@@ -1825,49 +2014,88 @@ impl App {
                         Item::Divider => Some(Item::Divider),
                         _ => None,
                     })
-                    .collect()
+                    .collect();
+                (entity, entries)
             })
             .collect();
-        let menu = Some(cosmic::widget::menu::nav_context(&HashMap::new(), items));
-        let mut nav = segmented_button::vertical(nav_model)
-            .on_activate(Message::NavPlace)
-            .drag_id(self.nav_drag_id)
-            .on_dnd_enter(|entity, _| Message::DndEnterNav(entity))
-            .on_dnd_leave(|_| Message::DndExitNav)
-            .on_dnd_drop(Message::DndDropNav)
-            .on_context(Message::NavBarContext)
-            .on_close(Message::NavBarClose)
-            .on_middle_press(|entity| {
-                Message::NavMenuAction(NavMenuAction::OpenInNewTab(entity))
-            })
-            .context_menu(menu)
-            .close_icon(icon::from_name("media-eject-symbolic").size(16).icon())
-            .button_height(28)
-            .button_padding([8, 4, 8, 4])
-            .button_spacing(8)
-            .spacing(4)
-            .style(crate::palette::nav_look());
 
-        #[cfg(feature = "wayland")]
-        {
-            nav = nav
-                .window_id_maybe(self.core().main_window_id())
-                .on_surface_action(Message::Surface)
+        let mut sections = Vec::with_capacity(self.nav_groups.len());
+        let mut trash = None;
+        for group in &self.nav_groups {
+            let items = group
+                .masters()
+                .iter()
+                .map(|m| menus.remove(m).unwrap_or_default())
+                .collect();
+            let menu = Some(cosmic::widget::menu::nav_context(&HashMap::new(), items));
+            let m = group.to_master();
+            let mut nav = segmented_button::vertical(&group.model)
+                .on_activate({
+                    let m = m.clone();
+                    move |e| Message::NavPlace(m(e))
+                })
+                .drag_id(group.section.drag_id())
+                .on_dnd_enter({
+                    let m = m.clone();
+                    move |e, _| Message::DndEnterNav(m(e))
+                })
+                .on_dnd_leave(|_| Message::DndExitNav)
+                .on_dnd_drop({
+                    let m = m.clone();
+                    move |e, data: Option<ClipboardPaste>, action| {
+                        Message::DndDropNav(m(e), data, action)
+                    }
+                })
+                .on_context({
+                    let m = m.clone();
+                    move |e| Message::NavBarContext(m(e))
+                })
+                .on_close({
+                    let m = m.clone();
+                    move |e| Message::NavBarClose(m(e))
+                })
+                .on_middle_press(move |e| {
+                    Message::NavMenuAction(NavMenuAction::OpenInNewTab(m(e)))
+                })
+                .context_menu(menu)
+                .close_icon(icon::from_name("media-eject-symbolic").size(16).icon())
+                .button_height(28)
+                .button_padding([8, 4, 8, 4])
+                .button_spacing(8)
+                .spacing(4)
+                .style(crate::palette::nav_look());
+
+            #[cfg(feature = "wayland")]
+            {
+                nav = nav
+                    .window_id_maybe(self.core().main_window_id())
+                    .on_surface_action(Message::Surface)
+            }
+
+            let count = group.model.iter().count();
+            let places: Element<_> = if group.section == Section::Drives {
+                // Taller rows, and a track under each name.
+                let nav = nav.button_height(crate::places::DRIVE_ROW);
+                let tracks = crate::ariadne_ui::usage_tracks(
+                    group.usage(&self.nav_model),
+                    crate::places::DRIVE_ROW,
+                    4,
+                );
+                cosmic::iced::widget::stack![nav, tracks].into()
+            } else {
+                nav.into()
+            };
+            match group.section.label() {
+                Some(label) => sections.push(crate::ariadne_ui::place_section(
+                    Some(label),
+                    count,
+                    places,
+                )),
+                None => trash = Some(crate::ariadne_ui::place_section(None, count, places)),
+            }
         }
 
-        let count = nav_model.iter().count();
-        let body = widget::column::with_children([
-            crate::ariadne_ui::header("places", format!("{count:02}")),
-            widget::scrollable(widget::container(nav).padding([8, 8, 8, 8]))
-                .class(cosmic::style::iced::Scrollable::Minimal)
-                .height(Length::Fill)
-                .into(),
-        ]);
-        let panel = widget::container(body)
-            .class(crate::palette::panel())
-            .width(Length::Fixed(232.0))
-            .height(Length::Fill);
-        Some(widget::container(panel).padding([0, 2, 2, 0]).into())
+        Some(crate::ariadne_ui::places_panel(sections, trash))
     }
 
     /// The context menu entries of every place, for COSMIC's nav bar and the places panel alike.
@@ -1974,15 +2202,26 @@ impl App {
     /// The strip under the files: what ariadne is doing, then the undo thread, one knot per move.
     fn ariadne_footer(&self) -> Element<'_, Message> {
         let ladder = crate::palette::ladder();
-        let typed: String = self.status.line.chars().take(self.status_shown).collect();
-        let typing = self.status_shown < self.status.line.chars().count();
-        let cursor = if typing || self.status.busy { " ▮" } else { "" };
+        let held = self
+            .status_hold
+            .as_ref()
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(line, _)| line.clone());
+        let (typed, cursor) = match held {
+            Some(line) => (line, ""),
+            None => {
+                let typed: String = self.status.line.chars().take(self.status_shown).collect();
+                let typing = self.status_shown < self.status.line.chars().count();
+                (typed, if typing || self.status.busy { " ▮" } else { "" })
+            }
+        };
         let status = widget::text::caption(format!("{typed}{cursor}"))
             .class(crate::palette::secondary());
 
+        // The thread keeps its last 16 knots, so the status line keeps its room.
         let snapshot = crate::ariadne::snapshot();
-        let shown = snapshot.moves.len().saturating_sub(24);
-        let mut knots = widget::row::with_capacity(24)
+        let shown = snapshot.moves.len().saturating_sub(16);
+        let mut knots = widget::row::with_capacity(16)
             .spacing(6)
             .align_y(Alignment::Center);
         for m in &snapshot.moves[shown..] {
@@ -2053,19 +2292,32 @@ impl App {
             // The ledger under the footer rail, as the launcher's: the machine's line typed
             // out on the left, the thread, the keys on the right, all in the instrument register.
             use crate::yorha::{Tone, micro};
-            let line = if self.status.line.is_empty() {
+            let line = if typed.is_empty() && cursor.is_empty() {
                 "ready".to_string()
             } else {
                 format!("{typed}{cursor}")
             };
+            // The line takes the room left; the keys say only the ones worth a reminder, and
+            // while a plan is up, the ones that work it.
+            let keys = if self.organize_open() && self.organize.plan.is_some() {
+                // As many as the window has room for, beside the status; Move is always said.
+                let room = match self.size.map_or(0.0, |s| s.width) {
+                    w if w >= 1500.0 => 4,
+                    w if w >= 1200.0 => 3,
+                    _ => 2,
+                };
+                let mut keys: Vec<&str> = self.organize.hint().into_iter().take(room).collect();
+                keys.push("ctrl+enter move");
+                keys.join("   ")
+            } else {
+                "ctrl+f search   ctrl+3 map   ctrl+z undo".to_string()
+            };
             return widget::row::with_children([
-                micro(&line, Tone::Secondary),
-                widget::space::horizontal().into(),
+                widget::container(micro(&line, Tone::Secondary))
+                    .width(Length::Fill)
+                    .into(),
                 knots.into(),
-                micro(
-                    "up down select   enter open   ctrl+f search   ctrl+3 map   ctrl+z undo",
-                    Tone::Secondary,
-                ),
+                micro(&keys, Tone::Secondary),
             ])
             .align_y(Alignment::Center)
             .spacing(24)
@@ -2273,6 +2525,7 @@ impl App {
             let active = self.nav_model.active();
             segmented_button::Selectable::deactivate(&mut self.nav_model, active);
         }
+        crate::places::sync(&mut self.nav_groups, nav_bar_id);
     }
 
     fn update_nav_model(&mut self) {
@@ -2286,6 +2539,7 @@ impl App {
             b.text(inbox_text)
                 .icon(icon::from_name("mail-unread-symbolic"))
                 .data(Location::Inbox)
+                .data(Section::Ariadne)
         });
 
         if self.config.show_recents {
@@ -2293,6 +2547,7 @@ impl App {
                 b.text(fl!("recents"))
                     .icon(icon::from_name("document-open-recent-symbolic"))
                     .data(Location::Recents)
+                    .data(Section::Ariadne)
             });
         }
 
@@ -2321,16 +2576,32 @@ impl App {
                             _ => Location::Path(path.clone()),
                         })
                         .data(FavoriteIndex(favorite_i))
+                        .data(Section::Places)
                 });
             }
         }
 
-        nav_model = nav_model.insert(|b| {
-            b.text(fl!("trash"))
-                .icon(icon::icon(Trash::icon_symbolic(16)))
-                .data(Location::Trash)
-                .divider_above()
-        });
+        // The disks fstab mounts, which gvfs leaves out, with how full each is.
+        let drives = crate::places::drives();
+        for (i, drive) in drives.iter().enumerate() {
+            let name = drive.name.clone();
+            let path = drive.path.clone();
+            let used = drive.used;
+            nav_model = nav_model.insert(move |mut b| {
+                b = b
+                    .text(name)
+                    .icon(icon::from_name("drive-harddisk-symbolic").size(16))
+                    .data(Location::Path(path))
+                    .data(Section::Drives);
+                if let Some(used) = used {
+                    b = b.data(used);
+                }
+                if i == 0 {
+                    b = b.divider_above();
+                }
+                b
+            });
+        }
 
         if !MOUNTERS.is_empty() {
             nav_model = nav_model.insert(|b| {
@@ -2345,21 +2616,38 @@ impl App {
                         fl!("networks"),
                         None,
                     ))
+                    .data(Section::Network)
                     .divider_above()
             });
         }
 
-        // Collect all mounter items
+        // Collect all mounter items, but not a disk the Drives list already holds
         let mut nav_items = Vec::new();
         for (key, items) in &self.mounter_items {
-            nav_items.extend(items.iter().map(|item| (*key, item)));
+            nav_items.extend(
+                items
+                    .iter()
+                    .filter(|item| {
+                        !item
+                            .path()
+                            .is_some_and(|p| drives.iter().any(|d| d.path == p))
+                    })
+                    .map(|item| (*key, item)),
+            );
         }
         // Sort by name lexically
         nav_items.sort_by(|a, b| LANGUAGE_SORTER.compare(&a.1.name(), &b.1.name()));
         // Add items to nav model
         for (i, (key, item)) in nav_items.into_iter().enumerate() {
             nav_model = nav_model.insert(|mut b| {
-                b = b.text(item.name()).data(MounterData(key, item.clone()));
+                b = b
+                    .text(item.name())
+                    .data(MounterData(key, item.clone()))
+                    .data(if item.is_remote() {
+                        Section::Network
+                    } else {
+                        Section::Drives
+                    });
                 let uri = item.uri();
                 if let Some(path) = item.path() {
                     if item.is_remote() {
@@ -2383,7 +2671,16 @@ impl App {
             });
         }
 
+        nav_model = nav_model.insert(|b| {
+            b.text(fl!("trash"))
+                .icon(icon::icon(Trash::icon_symbolic(16)))
+                .data(Location::Trash)
+                .data(Section::Trash)
+                .divider_above()
+        });
+
         self.nav_model = nav_model.build();
+        self.nav_groups = crate::places::split(&self.nav_model);
 
         let tab_entity = self.tab_model.active();
         if let Some(tab) = self.tab_model.data::<Tab>(tab_entity) {
@@ -2775,6 +3072,7 @@ impl App {
                 .add(
                     settings::item::builder(fl!("palette-file")).control(
                         widget::text_input("", self.palette_input.as_str())
+                            .font(cosmic::font::default())
                             .on_input(Message::PaletteInput)
                             .on_submit(|_| Message::PaletteSubmit)
                             .width(Length::Fixed(280.0)),
@@ -2783,6 +3081,7 @@ impl App {
                 .add(
                     settings::item::builder(fl!("font")).control(
                         widget::text_input("", self.font_input.as_str())
+                            .font(cosmic::font::default())
                             .on_input(Message::FontInput)
                             .on_submit(|_| Message::FontSubmit)
                             .width(Length::Fixed(280.0)),
@@ -2791,6 +3090,7 @@ impl App {
                 .add(
                     settings::item::builder(fl!("icons")).control(
                         widget::text_input("", self.icons_input.as_str())
+                            .font(cosmic::font::default())
                             .on_input(Message::IconsInput)
                             .on_submit(|_| Message::IconsSubmit)
                             .width(Length::Fixed(280.0)),
@@ -3040,17 +3340,22 @@ impl Application for App {
             windows: FxHashMap::default(),
             nav_dnd_hover: None,
             inbox_count: 0,
+            detail_hidden: false,
             palette_input,
             font_input,
             icons_input,
             status: crate::ariadne::Activity::default(),
+            status_hold: None,
+            organize_toast: None,
             status_shown: 0,
             knot_card: None,
             tidy_names: HashMap::new(),
+            organize: crate::organize::Organize::default(),
             tab_dnd_hover: None,
             type_select_prefix: String::new(),
             type_select_last_key: None,
             nav_drag_id: DragId::new(),
+            nav_groups: Vec::new(),
             tab_drag_id: DragId::new(),
             auto_scroll_speed: None,
             file_dialog_opt: None,
@@ -3161,6 +3466,7 @@ impl Application for App {
 
     fn on_nav_select(&mut self, entity: Entity) -> Task<Self::Message> {
         self.nav_model.activate(entity);
+        crate::places::sync(&mut self.nav_groups, Some(entity));
         if let Some(location) = self.nav_model.data::<Location>(entity) {
             let should_open = match location {
                 #[cfg(feature = "gvfs")]
@@ -3294,6 +3600,31 @@ impl Application for App {
         {
             tab.gallery = false;
             return Task::none();
+        }
+
+        // Organize, one layer per Escape: "Discard changes?" (as Keep editing), then the sheet,
+        // then the panel, which asks first when the plan has edits.
+        if self.organize_open() {
+            // Escape in a name field only leaves the field (the field let go of the focus
+            // already); the keyboard is back on the cursor.
+            if self.organize.editing.take().is_some() {
+                return Task::none();
+            }
+            if self.organize.send_menu.take().is_some() {
+                return Task::none();
+            }
+            if self.organize.confirm.is_some() {
+                self.organize.confirm = None;
+                return Task::none();
+            }
+            if self.organize.sheet {
+                self.organize.sheet = false;
+                return crate::organize::measure();
+            }
+            if self.organize.dirty() {
+                self.organize.confirm = Some(crate::organize::Pending::Close);
+                return Task::none();
+            }
         }
 
         // Close menus and context panes in order per message
@@ -3864,6 +4195,64 @@ impl Application for App {
                 let in_surface_ids = false;
                 if self.core.main_window_id() == Some(window_id) || in_surface_ids {
                     let entity = self.tab_model.active();
+                    let enter = matches!(&key, Key::Named(iced::keyboard::key::Named::Enter));
+                    // Ctrl+Enter is Move from anywhere while a plan is up; a bare Enter never is.
+                    if enter && modifiers == Modifiers::CTRL && self.organize_open() {
+                        return self.update(Message::OrganizeCommit(window_id));
+                    }
+                    // While a plan is up the Organize panel has the keyboard: the arrows walk its
+                    // cursor, Space ticks, F2 names, Enter opens a card, s is
+                    // Send to, Delete marks a copy for the trash, 1 2 3 go to the parts, u takes
+                    // a rename back, y and n answer "Also move…?", Ctrl+T opens the table.
+                    // Nothing else reaches the file list or type-to-search: only Undo, Organize
+                    // and closing the window go on.
+                    if self.organize_open() && self.organize.plan.is_some() {
+                        use crate::organize::PanelKey;
+                        use iced::keyboard::key::Named;
+                        let panel = match &key {
+                            _ if !modifiers.is_empty() => None,
+                            Key::Named(Named::ArrowUp) => Some(PanelKey::Up),
+                            Key::Named(Named::ArrowDown) => Some(PanelKey::Down),
+                            Key::Named(Named::PageUp) => Some(PanelKey::PrevCard),
+                            Key::Named(Named::PageDown) => Some(PanelKey::NextCard),
+                            Key::Named(Named::F2) => Some(PanelKey::Rename),
+                            Key::Named(Named::Enter) => Some(PanelKey::Enter),
+                            Key::Named(Named::Delete) => Some(PanelKey::Trash),
+                            Key::Character(c) => match c.as_str() {
+                                " " => Some(PanelKey::Space),
+                                "s" => Some(PanelKey::Send),
+                                "1" => Some(PanelKey::Part(0)),
+                                "2" => Some(PanelKey::Part(1)),
+                                "3" => Some(PanelKey::Part(2)),
+                                "u" => Some(PanelKey::Unrename),
+                                "y" => Some(PanelKey::Carry(true)),
+                                "n" => Some(PanelKey::Carry(false)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(panel) = panel {
+                            return self.update(Message::OrganizeKey(panel));
+                        }
+                        if modifiers == Modifiers::CTRL
+                            && matches!(&key, Key::Character(c) if c.as_str() == "t")
+                        {
+                            return self.update(Message::OrganizeSheet(!self.organize.sheet));
+                        }
+                        let through = self
+                            .key_binds
+                            .iter()
+                            .find(|(key_bind, _)| key_bind.matches(modifiers, &key, Some(&physical_key)))
+                            .map(|(_, action)| action)
+                            .filter(|action| {
+                                matches!(action, Action::AriadneUndo | Action::Organize | Action::WindowClose)
+                            })
+                            .map(|action| action.message(Some(entity)));
+                        return match through {
+                            Some(message) => self.update(message),
+                            None => Task::none(),
+                        };
+                    }
                     for (key_bind, action) in &self.key_binds {
                         if key_bind.matches(modifiers, &key, Some(&physical_key)) {
                             return self.update(action.message(Some(entity)));
@@ -4866,15 +5255,8 @@ impl Application for App {
                 ));
             }
             Message::SearchActivate => {
-                let mut tasks = vec![];
-
-                if self.search_get().is_none() {
-                    tasks.push(self.search_set_active(Some(String::new())));
-                } else {
-                    tasks.push(widget::text_input::focus(self.search_id.clone()));
-                };
-
-                return Task::batch(tasks);
+                // The field is always on the top bar; typing in it starts the search.
+                return widget::text_input::focus(self.search_id.clone());
             }
             Message::SearchClear => {
                 return self.search_set_active(None);
@@ -4961,6 +5343,11 @@ impl Application for App {
                 self.tidy_names.insert(id, name);
             }
             Message::AriadneActivity(activity) => {
+                self.organize.progressed(activity.planning);
+                // New work on the daemon ends the held line about the last Organize.
+                if activity.busy {
+                    self.status_hold = None;
+                }
                 if activity != self.status {
                     self.status_shown = if self.config.motion {
                         0
@@ -4993,17 +5380,350 @@ impl Application for App {
                     ));
                 }
             }
+            Message::Organize(entity_opt) => {
+                let paths: Vec<PathBuf> = self.selected_paths(entity_opt).collect();
+                if paths.is_empty() {
+                    return Task::none();
+                }
+                // A plan with edits is not dropped for a new one without asking.
+                if self.organize_open() && self.organize.dirty() {
+                    self.organize.confirm = Some(crate::organize::Pending::Organize(paths));
+                    return Task::none();
+                }
+                return self.update(Message::OrganizeStart(paths));
+            }
+            Message::OrganizeStart(paths) => {
+                // The panel opens at once and waits; the plan can take minutes.
+                let asked = self.organize.asked + 1;
+                self.organize = crate::organize::Organize::asking(asked, paths.clone());
+                self.context_page = ContextPage::Organize;
+                self.set_show_context(true);
+                return cosmic::task::future(async move {
+                    tokio::task::spawn_blocking(move || {
+                        // A folder means the files loose in it; say so when it has folders too.
+                        let subfolders = paths.iter().any(|p| {
+                            std::fs::read_dir(p).is_ok_and(|mut entries| {
+                                entries.any(|e| e.is_ok_and(|e| e.file_type().is_ok_and(|t| t.is_dir())))
+                            })
+                        });
+                        Message::OrganizePlanned(asked, crate::ariadne::plan(&paths), subfolders)
+                    })
+                    .await
+                    .unwrap_or(Message::OrganizePlanned(asked, None, false))
+                });
+            }
+            Message::OrganizePlanned(asked, plan, subfolders) => {
+                if asked != self.organize.asked || !self.organize_open() {
+                    return Task::none();
+                }
+                match plan {
+                    Some(plan) => {
+                        self.organize.set_plan(plan, subfolders);
+                        // The keyboard goes to the panel's cursor: whatever widget held the
+                        // focus lets go, so the arrows can't walk the file list behind it.
+                        // The status line is read again now, not on the next poll.
+                        let status = match crate::ariadne::activity() {
+                            Some(activity) => self.update(Message::AriadneActivity(activity)),
+                            None => Task::none(),
+                        };
+                        return Task::batch([
+                            status,
+                            crate::organize::measure(),
+                            widget::button::focus(widget::Id::unique()),
+                        ]);
+                    }
+                    None => {
+                        self.set_show_context(false);
+                        return self
+                            .toasts
+                            .push(widget::toaster::Toast::new(fl!("organize-failed")))
+                            .map(cosmic::Action::App);
+                    }
+                }
+            }
+            // Edits change where the panel's parts start, so the list is measured again.
+            // A click on a tick also puts the cursor there, so Space goes on from it.
+            Message::OrganizeTick(g, f, ticked) => {
+                self.organize.tick(g, f, ticked);
+                self.organize.point(crate::organize::Stop::Row(g, f));
+                return crate::organize::measure();
+            }
+            Message::OrganizeTickGroup(g, ticked) => {
+                self.organize.tick_card(g, ticked);
+                self.organize.point_card(g);
+                return crate::organize::measure();
+            }
+            Message::OrganizeName(g, name) => {
+                self.organize.rename(g, name);
+                return crate::organize::measure();
+            }
+            Message::OrganizeNamed => {
+                // Ctrl+Enter is Move, not the end of the name: if Move can't go (a bad name),
+                // the field keeps the keyboard so the name can be fixed.
+                if self.modifiers.control() {
+                    return Task::none();
+                }
+                self.organize.editing = None;
+                return widget::button::focus(widget::Id::unique());
+            }
+            Message::OrganizeKey(key) => {
+                use crate::organize::{Answer, PanelKey};
+                // While a name is typed the arrows stay in the field; the sheet has no cursor;
+                // behind "Discard changes?" the keys do nothing, not even in the file list.
+                if self.organize.sheet
+                    || self.organize.confirm.is_some()
+                    || (self.organize.editing.is_some() && matches!(key, PanelKey::Up | PanelKey::Down))
+                {
+                    return Task::none();
+                }
+                return match self.organize.key(key) {
+                    Answer::Name(g) => {
+                        let id = crate::organize::name_id(g);
+                        Task::batch([
+                            widget::text_input::focus(id.clone()),
+                            widget::text_input::select_all(id),
+                        ])
+                    }
+                    Answer::Send(sending, folder) => self.update(Message::OrganizeSendTo(sending, folder)),
+                    Answer::Browse(sending) => self.update(Message::OrganizeBrowse(sending)),
+                    Answer::Done => match key {
+                        PanelKey::Part(part) => self.update(Message::OrganizeTab(part)),
+                        _ => crate::organize::measure(),
+                    },
+                };
+            }
+            Message::UndoKey(window_id) => {
+                if self.core.main_window_id() != Some(window_id) {
+                    return Task::none();
+                }
+                // With a plan open the text box is a name field: Ctrl+Z there takes back the
+                // last edit of the name (or nothing), never a batch from earlier.
+                if self.organize_open() && self.organize.plan.is_some() {
+                    self.organize.undo_name();
+                    return crate::organize::measure();
+                }
+                return self.update(Message::AriadneUndo(None));
+            }
+            Message::OrganizeCarry(lead, carry) => {
+                self.organize.answer_carry(lead, carry);
+                return crate::organize::measure();
+            }
+            Message::OrganizeUnrename(lead) => {
+                self.organize.unrename(lead);
+                // The field showed the old name; it lets go so it shows the daemon's again.
+                return Task::batch([
+                    widget::button::focus(widget::Id::unique()),
+                    crate::organize::measure(),
+                ]);
+            }
+            Message::OrganizeFold(fold) => {
+                self.organize.fold(fold);
+                return crate::organize::measure();
+            }
+            Message::OrganizeSheet(open) => {
+                self.organize.sheet = open && self.organize.plan.is_some();
+                self.organize.send_menu = None;
+                if open {
+                    // The table opens on every file again.
+                    self.organize.set_filter(String::new());
+                } else {
+                    return crate::organize::measure();
+                }
+            }
+            Message::OrganizeTab(part) => {
+                if let Some(offset) = self.organize.jump(part) {
+                    return scrollable::scroll_to(crate::organize::Organize::list_id(), offset);
+                }
+            }
+            Message::OrganizeScrolled(y) => {
+                self.organize.scrolled(y);
+            }
+            Message::OrganizeClock => {
+                // The folder being organized went (trashed, moved away): the plan is about files
+                // that are no longer there, so it goes, and says so.
+                if self.organize_open() && self.organize.gone() {
+                    self.organize = crate::organize::Organize::asking(self.organize.asked, Vec::new());
+                    self.set_show_context(false);
+                    return self
+                        .toasts
+                        .push(widget::toaster::Toast::new(fl!("organize-gone")))
+                        .map(cosmic::Action::App);
+                }
+            }
+            Message::OrganizeSections(measured) => {
+                if let Some(offset) = self.organize.measured(measured) {
+                    return scrollable::scroll_to(crate::organize::Organize::list_id(), offset);
+                }
+            }
+            Message::OrganizeClose => {
+                if self.organize.dirty() {
+                    self.organize.confirm = Some(crate::organize::Pending::Close);
+                    return Task::none();
+                }
+                self.organize = crate::organize::Organize::asking(self.organize.asked, Vec::new());
+                self.set_show_context(false);
+            }
+            Message::OrganizeDiscard(discard) => {
+                let pending = self.organize.confirm.take();
+                if !discard {
+                    return Task::none();
+                }
+                match pending {
+                    Some(crate::organize::Pending::Close) => {
+                        self.organize = crate::organize::Organize::asking(self.organize.asked, Vec::new());
+                        self.set_show_context(false);
+                    }
+                    Some(crate::organize::Pending::Organize(paths)) => {
+                        return self.update(Message::OrganizeStart(paths));
+                    }
+                    None => {}
+                }
+            }
+            Message::OrganizeSendMenu(sending) => {
+                self.organize.open_send(sending, false);
+            }
+            Message::OrganizeSendTo(sending, folder) => {
+                self.organize.send_menu = None;
+                if self.organize.send(&sending, folder) {
+                    return crate::organize::measure();
+                }
+            }
+            Message::OrganizeTrash(path) => {
+                // Only a mark: the copy goes to the trash with the Move, in its batch.
+                self.organize.toggle_trash(&path);
+                return crate::organize::measure();
+            }
+            Message::OrganizeBrowse(sending) => {
+                self.organize.send_menu = None;
+                let paths = self.organize.paths(&sending);
+                self.organize.sending = Some(sending);
+                return self.destination_selection_dialog(
+                    &paths,
+                    Message::OrganizeSent,
+                    fl!("organize-send-title"),
+                    fl!("organize-send-label"),
+                );
+            }
+            Message::OrganizeSent(result) => {
+                // The picker's window goes, as Move to's does; only the plan changes, no file.
+                if let Some(dialog) = self.file_dialog_opt.take() {
+                    self.windows.remove(&dialog.window_id());
+                }
+                let sending = self.organize.sending.take();
+                if let (DialogResult::Open(folders), Some(sending)) = (result, sending)
+                    && let Some(folder) = folders.into_iter().next()
+                    && self.organize.send(&sending, folder)
+                {
+                    return crate::organize::measure();
+                }
+            }
+            Message::OrganizeReveal(path) => {
+                self.organize.sheet = false;
+                return self.reveal(path);
+            }
+            Message::OrganizeFilter(filter) => {
+                self.organize.set_filter(filter);
+            }
+            Message::OrganizeCommit(window_id) => {
+                let ready = self.organize_open()
+                    && self.organize.confirm.is_none()
+                    && self.organize.can_move();
+                if ready && self.core.main_window_id() == Some(window_id) {
+                    return self.update(Message::OrganizeMove);
+                }
+            }
+            Message::OrganizeMove => {
+                let Some(plan) = self.organize.edited() else {
+                    return Task::none();
+                };
+                if !self.organize.can_move() {
+                    return Task::none();
+                }
+                self.organize = crate::organize::Organize::asking(self.organize.asked, Vec::new());
+                self.set_show_context(false);
+                // Focus was on the panel's ticks; give it back to the view.
+                let unfocus = widget::button::focus(widget::Id::unique());
+                return Task::batch([unfocus, cosmic::task::future(async move {
+                    let done = tokio::task::spawn_blocking(move || crate::ariadne::apply_plan(&plan))
+                        .await
+                        .ok()
+                        .flatten();
+                    Message::OrganizeMoved(done)
+                })]);
+            }
+            Message::OrganizeMoved(done) => {
+                self.refresh_ariadne();
+                let rescan = self.rescan_tabs();
+                // Files skipped on the way (gone, or a name taken) stay; the toast only counts them.
+                let toast = match done {
+                    None => widget::toaster::Toast::new(fl!("organize-failed")),
+                    Some(o) if o.moved.is_empty() && o.trashed.is_empty() => {
+                        widget::toaster::Toast::new(fl!("organize-nothing"))
+                    }
+                    Some(o) => {
+                        // Where things went: the folders by how many landed in each.
+                        let mut by: Vec<(&Path, usize)> = Vec::new();
+                        for to in o.moved.iter().filter_map(|m| m.to.parent()) {
+                            match by.iter_mut().find(|(folder, _)| *folder == to) {
+                                Some((_, n)) => *n += 1,
+                                None => by.push((to, 1)),
+                            }
+                        }
+                        by.sort_by(|a, b| b.1.cmp(&a.1));
+                        // Folders as sentences write them: Pictures/photos/2025, not just 2025.
+                        let name = |p: &Path| crate::organize::home_relative(p);
+                        let n = o.moved.len();
+                        let said = match by.as_slice() {
+                            [(only, _)] => fl!("organize-moved-one", n = n, folder = name(only)),
+                            [(a, _), (b, _)] => fl!(
+                                "organize-moved-one",
+                                n = n,
+                                folder = fl!("organize-and", a = name(a), b = name(b))
+                            ),
+                            [(a, _), (b, _), ..] => fl!(
+                                "organize-moved",
+                                n = n,
+                                folders = by.len(),
+                                top = fl!("organize-and", a = name(a), b = name(b))
+                            ),
+                            [] => fl!("organize-nothing"),
+                        };
+                        let said = if o.trashed.is_empty() {
+                            said
+                        } else {
+                            fl!("organize-trashed", said = said, n = o.trashed.len())
+                        };
+                        let note = if o.left.is_empty() {
+                            said
+                        } else {
+                            fl!("organize-moved-left", said = said, left = o.left.len())
+                        };
+                        // The status line says the batch as long as the toast stays.
+                        self.status_hold = Some((
+                            fl!("organize-status", n = n, folders = by.len()),
+                            Instant::now() + ORGANIZE_TOAST,
+                        ));
+                        let batch = o.batch.clone();
+                        // Long enough to look over what moved before Undo goes away.
+                        let toast = widget::toaster::Toast::new(note)
+                            .action(fl!("undo"), move |tid| Message::OrganizeUndo(tid, batch.clone()))
+                            .duration(ORGANIZE_TOAST);
+                        let (id, shown) = self.toasts.push_with_id(toast);
+                        self.organize_toast = Some((id, o.batch));
+                        return Task::batch([rescan, shown.map(cosmic::Action::App)]);
+                    }
+                };
+                return Task::batch([rescan, self.toasts.push(toast).map(cosmic::Action::App)]);
+            }
+            Message::OrganizeUndo(id, batch) => {
+                self.toasts.remove(id);
+                let undone = crate::ariadne::undo_batch(&batch);
+                return self.undone(undone, Some(&batch));
+            }
             Message::AriadneUndo(path) => {
                 self.knot_card = None;
-                let done = match &path {
-                    Some(path) => crate::ariadne::act(crate::ariadne::InboxVerb::Undo, path),
-                    None => crate::ariadne::undo_last(),
-                };
-                let note = if done { "Undone" } else { "Nothing to undo" };
-                return self
-                    .toasts
-                    .push(widget::toaster::Toast::new(note))
-                    .map(cosmic::Action::App);
+                let undone = crate::ariadne::undo(path.as_deref());
+                return self.undone(undone, None);
             }
             Message::PaletteChanged => {
                 if self.config.app_theme == AppTheme::Palette {
@@ -5383,6 +6103,10 @@ impl Application for App {
                         return Task::none();
                     }
 
+                    // The map covers either view; picking one closes it.
+                    if tab.map_open() {
+                        let _ = tab.update(tab::Message::MapToggle, self.modifiers);
+                    }
                     tab.config.view = view;
                 }
                 let mut config = self.config.tab;
@@ -5414,6 +6138,9 @@ impl Application for App {
                         self.core.window.show_context,
                     )));
                 }
+            }
+            Message::ToggleDetail => {
+                self.detail_hidden = !self.detail_hidden;
             }
             Message::Undo(_id) => {
                 // TODO: undo
@@ -6062,9 +6789,11 @@ impl Application for App {
         if !self.core.window.show_context {
             return None;
         }
-        // Under the palette Tidy and Settings are panels of the sheet, not drawers.
-        if matches!(self.context_page, ContextPage::Tidy | ContextPage::Settings)
-            && crate::palette::ladder().is_some()
+        // Under the palette Tidy, Organize and Settings are panels of the sheet, not drawers.
+        if matches!(
+            self.context_page,
+            ContextPage::Tidy | ContextPage::Organize | ContextPage::Settings
+        ) && crate::palette::ladder().is_some()
         {
             return None;
         }
@@ -6151,6 +6880,15 @@ impl Application for App {
                 }
                 drawer
             }
+            ContextPage::Organize => {
+                let mut drawer =
+                    context_drawer::context_drawer(self.organize.drawer(), Message::OrganizeClose)
+                .title(fl!("organize"));
+                if self.organize.plan.is_some() {
+                    drawer = drawer.header(self.organize.move_button());
+                }
+                drawer
+            }
         })
     }
 
@@ -6165,7 +6903,16 @@ impl Application for App {
                     .map(move |x| Message::TabMessage(Some(entity), x)),
             );
         }
-        let dialog_page = self.dialog_pages.front()?;
+        // The Organize sheet sits over the window while its panel is open; real dialogs win.
+        let Some(dialog_page) = self.dialog_pages.front() else {
+            if !self.organize_open() {
+                return None;
+            }
+            if self.organize.confirm.is_some() {
+                return Some(self.organize.confirm());
+            }
+            return self.organize.sheet.then(|| self.organize.sheet());
+        };
 
         let cosmic_theme::Spacing {
             space_xxs, space_s, ..
@@ -7098,54 +7845,170 @@ impl Application for App {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
-        vec![menu::menu_bar(
+        let mut elements = vec![menu::menu_bar(
             &self.core,
             self.tab_model.active_data::<Tab>(),
             &self.config,
             &self.modifiers,
             &self.key_binds,
             self.clipboard_has_content(),
-        )]
+        )];
+        let Some(tab) = self.tab_model.active_data::<Tab>() else {
+            return elements;
+        };
+        use crate::ariadne_ui::{bar_button, bar_icon, bar_text};
+        let go = |message| Message::TabMessage(None, message);
+
+        // Back and forward through this tab's history.
+        let back = (tab.history_i > 0 && !tab.history.is_empty()).then(|| go(tab::Message::GoPrevious));
+        let forward = (tab.history_i + 1 < tab.history.len()).then(|| go(tab::Message::GoNext));
+        let history = widget::row::with_children([
+            bar_icon(icon::from_name("go-previous-symbolic").handle(), bar_button(false, false), back),
+            bar_icon(icon::from_name("go-next-symbolic").handle(), bar_button(false, false), forward),
+        ])
+        .spacing(4);
+
+        // The sort: the field steps Name, date, Size; the arrow flips the direction.
+        let (sort, ascending, _) = tab.sort_options();
+        let sortable = !matches!(tab.location, Location::Search(..));
+        let dated = if tab.location.is_trash() {
+            HeadingOptions::TrashedOn
+        } else {
+            HeadingOptions::Modified
+        };
+        let next = match sort {
+            HeadingOptions::Name => dated,
+            HeadingOptions::Modified | HeadingOptions::TrashedOn => HeadingOptions::Size,
+            HeadingOptions::Size => HeadingOptions::Name,
+        };
+        let sorts = widget::row::with_children([
+            bar_text(
+                sort.to_string(),
+                sortable.then(|| go(tab::Message::SetSort(next, next != dated))),
+            ),
+            // An arrow in the ink: the theme's sort icons carry a hue.
+            bar_text(
+                if ascending { "↑" } else { "↓" }.to_string(),
+                sortable.then(|| go(tab::Message::SetSort(sort, !ascending))),
+            ),
+        ]);
+
+        elements.push(
+            widget::row::with_children([history.into(), sorts.into()])
+                .spacing(16)
+                .padding([0, 0, 0, 12])
+                .align_y(Alignment::Center)
+                .into(),
+        );
+        elements
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
-        let mut elements = Vec::with_capacity(3);
+        use crate::ariadne_ui::{Glyph, bar_button, bar_icon, bar_pair, glyph};
+        let tab = self.tab_model.active_data::<Tab>();
+        let mut elements = Vec::with_capacity(5);
+
+        // Search, always open. Clearing the field leaves the search; where search_set has no
+        // place to search from, the field takes no typing.
+        let searchable = tab.is_some_and(|tab| {
+            tab.location.path_opt().is_some()
+                || tab.location.is_recents()
+                || tab.location.is_trash()
+        });
+        elements.push(crate::ariadne_ui::search_field(
+            self.search_id.clone(),
+            fl!("search-placeholder"),
+            self.search_get().unwrap_or_default(),
+            searchable.then_some(|term: String| {
+                if term.is_empty() {
+                    Message::SearchClear
+                } else {
+                    Message::SearchInput(term)
+                }
+            }),
+            Message::SearchClear,
+        ));
+
+        // The view, one segment each, the current one latched in the one dark.
+        if let Some(tab) = tab {
+            let map = tab.map_open();
+            let view = |g: Glyph, on: bool, press: Message| {
+                bar_icon(glyph(g), bar_button(true, on), (!on).then_some(press))
+            };
+            elements.push(
+                widget::row::with_children([
+                    view(
+                        Glyph::Grid,
+                        !map && matches!(tab.config.view, tab::View::Grid),
+                        Message::TabView(None, tab::View::Grid),
+                    ),
+                    view(
+                        Glyph::List,
+                        !map && matches!(tab.config.view, tab::View::List),
+                        Message::TabView(None, tab::View::List),
+                    ),
+                    view(
+                        Glyph::Map,
+                        map,
+                        Message::TabMessage(None, tab::Message::MapToggle),
+                    ),
+                ])
+                .into(),
+            );
+        }
+
+        // The Inbox, with the suggestions waiting in it, as its sidebar entry.
+        let inbox = icon::from_name("mail-unread-symbolic").handle();
+        let open_inbox = Message::TabMessage(None, tab::Message::Location(Location::Inbox));
+        elements.push(match self.inbox_count {
+            0 => bar_icon(inbox, bar_button(false, false), Some(open_inbox)),
+            n => bar_pair(inbox, format!("{n:02}"), bar_button(false, false), open_inbox),
+        });
 
         // Tidy: the count of changes ariadne would make; opens the list of them.
         let ideas = crate::ariadne::snapshot().proposals.len();
         if ideas > 0 {
-            let label = format!("{}  {ideas}", fl!("tidy"));
-            elements.push(if crate::palette::ladder().is_some() {
-                crate::palette::act(label.to_uppercase())
-                    .on_press(Message::ToggleContextPage(ContextPage::Tidy))
-                    .into()
-            } else {
-                widget::button::text(label)
-                    .on_press(Message::ToggleContextPage(ContextPage::Tidy))
-                    .into()
-            });
+            elements.push(bar_pair(
+                glyph(Glyph::Tidy),
+                format!("{}  {ideas:02}", fl!("tidy")),
+                crate::palette::button(false),
+                Message::ToggleContextPage(ContextPage::Tidy),
+            ));
         }
 
-        // Search is a full-width bar under the header (see view): queries are sentences now.
-        if self.search_get().is_some() {
-            elements.push(
-                //TODO: selected state is not appearing different
-                widget::button::icon(icon::from_name("system-search-symbolic"))
-                    .on_press(Message::SearchClear)
-                    .padding(8)
-                    .selected(true)
-                    .into(),
+        // The details: framed in ink while they show, the dark stays with the view. Under the
+        // palette they are the panel beside the items; otherwise COSMIC's preview drawer.
+        let side_page = self.core.window.show_context
+            && matches!(
+                self.context_page,
+                ContextPage::Tidy | ContextPage::Organize | ContextPage::Settings
             );
+        let (details, press) = if crate::palette::ladder().is_some() {
+            (!self.detail_hidden && !side_page, Message::ToggleDetail)
         } else {
-            elements.push(
-                widget::button::icon(icon::from_name("system-search-symbolic"))
-                    .on_press(Message::SearchActivate)
-                    .padding(8)
-                    .into(),
-            );
-        }
+            (
+                self.core.window.show_context
+                    && matches!(self.context_page, ContextPage::Preview(..)),
+                Message::Preview(None),
+            )
+        };
+        elements.push(bar_icon(
+            glyph(Glyph::Info),
+            if details {
+                crate::palette::button(false)
+            } else {
+                bar_button(false, false)
+            },
+            Some(press),
+        ));
 
-        elements
+        vec![
+            widget::row::with_children(elements)
+                .spacing(8)
+                .padding([0, 8, 0, 0])
+                .align_y(Alignment::Center)
+                .into(),
+        ]
     }
 
     /// Creates a view after each update.
@@ -7158,25 +8021,16 @@ impl Application for App {
         crate::ariadne::set_tidy_open(
             self.core.window.show_context && self.context_page == ContextPage::Tidy,
         );
-        crate::ariadne::set_side_open(
-            self.core.window.show_context
-                && matches!(self.context_page, ContextPage::Tidy | ContextPage::Settings),
+        crate::ariadne::set_detail_hidden(
+            self.detail_hidden
+                || self.core.window.show_context
+                    && matches!(
+                        self.context_page,
+                        ContextPage::Tidy | ContextPage::Organize | ContextPage::Settings
+                    ),
         );
 
-        let mut tab_column = widget::column::with_capacity(4);
-
-        if let Some(term) = self.search_get() {
-            tab_column = tab_column.push(
-                widget::container(
-                    widget::text_input::search_input(fl!("search-placeholder"), term)
-                        .width(Length::Fill)
-                        .id(self.search_id.clone())
-                        .on_clear(Message::SearchClear)
-                        .on_input(Message::SearchInput),
-                )
-                .padding(space_xxs),
-            );
-        }
+        let mut tab_column = widget::column::with_capacity(3);
 
         if self.tab_model.len() > 1 {
             tab_column = tab_column.push(
@@ -7394,6 +8248,7 @@ impl Application for App {
                 stream::channel(
                     1,
                     |mut output: futures::channel::mpsc::Sender<Message>| async move {
+                        let _ = tokio::task::spawn_blocking(crate::ariadne::ensure_running).await;
                         let mut last = None;
                         loop {
                             let version = tokio::task::spawn_blocking(|| {
@@ -7440,6 +8295,20 @@ impl Application for App {
                 }) => match status {
                     event::Status::Ignored => {
                         Some(Message::Key(window_id, modifiers, key, physical_key, text))
+                    }
+                    // A text box keeps every key, Ctrl+Enter too; Organize's Move still hears it.
+                    event::Status::Captured
+                        if modifiers.control()
+                            && matches!(key, Key::Named(iced::keyboard::key::Named::Enter)) =>
+                    {
+                        Some(Message::OrganizeCommit(window_id))
+                    }
+                    // A text box has no undo of its own: Ctrl+Z in one is decided by the app.
+                    event::Status::Captured
+                        if modifiers == Modifiers::CTRL
+                            && matches!(&key, Key::Character(c) if c.as_str() == "z") =>
+                    {
+                        Some(Message::UndoKey(window_id))
                     }
                     event::Status::Captured => None,
                 },
@@ -7745,6 +8614,13 @@ impl Application for App {
         {
             subscriptions
                 .push(iced::time::every(time::Duration::from_millis(50)).map(|_| Message::FlashTick));
+        }
+
+        // A plan on its way counts its seconds in the open panel; a plan that came keeps
+        // looking for its folder, and is dropped if the folder goes.
+        if self.organize_open() && (self.organize.planning() || self.organize.plan.is_some()) {
+            subscriptions
+                .push(iced::time::every(time::Duration::from_secs(1)).map(|_| Message::OrganizeClock));
         }
 
         // The status line types itself out, 18 ms a character, then stops ticking.

@@ -39,6 +39,7 @@ use crate::config::{
 use crate::key_bind::key_binds;
 use crate::localize::LANGUAGE_SORTER;
 use crate::mounter::{MOUNTERS, MounterItem, MounterItems, MounterKey, MounterMessage};
+use crate::places::Section;
 use crate::tab::{self, HeadingOptions, ItemMetadata, Location, SearchLocation, Tab};
 use crate::zoom::{zoom_in_view, zoom_out_view, zoom_to_default};
 use crate::{fl, home_dir, menu, mime_icon};
@@ -466,6 +467,7 @@ enum Message {
     ModifiersChanged(Modifiers),
     MounterItems(MounterKey, MounterItems),
     Mouse(window::Id, mouse::Button),
+    NavPlace(segmented_button::Entity),
     NewFolder,
     NotifyEvents(Vec<DebouncedEvent>),
     NotifyWatcher(WatcherWrapper),
@@ -558,6 +560,8 @@ struct App {
     modifiers: Modifiers,
     mounter_items: FxHashMap<MounterKey, MounterItems>,
     nav_model: segmented_button::SingleSelectModel,
+    /// The places panel's sections, drawn from `nav_model`.
+    nav_groups: Vec<crate::places::Group>,
     result_opt: Option<DialogResult>,
     search_id: widget::Id,
     tab: Tab,
@@ -572,6 +576,46 @@ struct App {
 }
 
 impl App {
+    /// The window's places panel in its sections, so the picker reads like the window.
+    fn places(&self) -> Option<Element<'_, Message>> {
+        if !self.core.nav_bar_active() {
+            return None;
+        }
+        let sections = self
+            .nav_groups
+            .iter()
+            .map(|group| {
+                let m = group.to_master();
+                let nav = segmented_button::vertical(&group.model)
+                    .on_activate(move |e| Message::NavPlace(m(e)))
+                    .close_icon(widget::icon::from_name("media-eject-symbolic").size(16).icon())
+                    .button_height(28)
+                    .button_padding([8, 4, 8, 4])
+                    .button_spacing(8)
+                    .spacing(4)
+                    .style(crate::palette::nav_look());
+                let places: Element<_> = if group.section == Section::Drives {
+                    // As in the window: taller rows, and a track under each name.
+                    let nav = nav.button_height(crate::places::DRIVE_ROW);
+                    let tracks = crate::ariadne_ui::usage_tracks(
+                        group.usage(&self.nav_model),
+                        crate::places::DRIVE_ROW,
+                        4,
+                    );
+                    cosmic::iced::widget::stack![nav, tracks].into()
+                } else {
+                    nav.into()
+                };
+                crate::ariadne_ui::place_section(
+                    group.section.label(),
+                    group.model.iter().count(),
+                    places,
+                )
+            })
+            .collect();
+        Some(crate::ariadne_ui::places_panel(sections, None))
+    }
+
     fn button_view(&self) -> Element<'_, Message> {
         let cosmic_theme::Spacing {
             space_xxxs,
@@ -639,8 +683,13 @@ impl App {
                 .align_y(Alignment::Center)
                 .spacing(space_xxs);
         }
+        let palette = crate::palette::ladder().is_some();
         row = row.push(widget::space::horizontal());
-        row = row.push(widget::button::standard(fl!("cancel")).on_press(Message::Cancel));
+        row = row.push(if palette {
+            crate::palette::quiet(fl!("cancel")).on_press(Message::Cancel)
+        } else {
+            widget::button::standard(fl!("cancel")).on_press(Message::Cancel)
+        });
 
         let mut has_selected = false;
         if let Some(items) = self.tab.items_opt() {
@@ -651,7 +700,21 @@ impl App {
                 }
             }
         }
-        row = row.push(
+        let accept = if self.flags.kind.save() {
+            if let DialogKind::SaveFile { filename } = &self.flags.kind {
+                (!filename.is_empty()).then_some(Message::Save(false))
+            } else {
+                None
+            }
+        } else if has_selected || self.flags.kind.is_dir() {
+            Some(Message::Open)
+        } else {
+            None
+        };
+        row = row.push(if palette {
+            let label: String = self.accept_label.spans.iter().map(|s| s.text.as_str()).collect();
+            Element::from(crate::palette::act(label).on_press_maybe(accept))
+        } else {
             //TODO: easier way to create buttons with rich text
             widget::button::custom(
                 widget::row::with_children([Element::from(&self.accept_label)])
@@ -659,26 +722,20 @@ impl App {
                     .width(Length::Shrink)
                     .height(space_l)
                     .spacing(space_xxxs)
-                    .align_y(Alignment::Center)
+                    .align_y(Alignment::Center),
             )
             .padding(0)
-            .on_press_maybe(if self.flags.kind.save() {
-                if let DialogKind::SaveFile { filename } = &self.flags.kind {
-                    (!filename.is_empty()).then_some(Message::Save(false))
-                } else {
-                    None
-                }
-            } else if has_selected || self.flags.kind.is_dir() {
-                Some(Message::Open)
-            } else {
-                None
-            })
+            .on_press_maybe(accept)
             .class(widget::button::ButtonClass::Suggested)
             /*TODO: a11y feature: .label(&self.accept_label.text)*/
-        );
+            .into()
+        });
 
         col = col.push(row);
 
+        if palette {
+            return widget::container(col).padding([6, 8, 8, 8]).into();
+        }
         widget::layer_container(col)
             .layer(cosmic_theme::Layer::Primary)
             .padding([8, space_xs])
@@ -874,6 +931,7 @@ impl App {
             let active = self.nav_model.active();
             segmented_button::Selectable::deactivate(&mut self.nav_model, active);
         }
+        crate::places::sync(&mut self.nav_groups, nav_bar_id);
     }
 
     fn update_nav_model(&mut self) {
@@ -884,6 +942,7 @@ impl App {
                 b.text(fl!("recents"))
                     .icon(widget::icon::from_name("document-open-recent-symbolic"))
                     .data(Location::Recents)
+                    .data(Section::Places)
             });
         }
 
@@ -905,21 +964,57 @@ impl App {
                             .size(16),
                         )
                         .data(Location::Path(path.clone()))
+                        .data(Section::Places)
                 });
             }
         }
 
-        // Collect all mounter items
+        // The disks fstab mounts, as the window lists them.
+        let drives = crate::places::drives();
+        for drive in &drives {
+            let name = drive.name.clone();
+            let path = drive.path.clone();
+            let used = drive.used;
+            nav_model = nav_model.insert(move |mut b| {
+                b = b
+                    .text(name)
+                    .icon(widget::icon::from_name("drive-harddisk-symbolic").size(16))
+                    .data(Location::Path(path))
+                    .data(Section::Drives);
+                if let Some(used) = used {
+                    b = b.data(used);
+                }
+                b
+            });
+        }
+
+        // Collect all mounter items, but not a disk the Drives list already holds
         let mut nav_items = Vec::new();
         for (key, items) in &self.mounter_items {
-            nav_items.extend(items.iter().map(|item| (*key, item)));
+            nav_items.extend(
+                items
+                    .iter()
+                    .filter(|item| {
+                        !item
+                            .path()
+                            .is_some_and(|p| drives.iter().any(|d| d.path == p))
+                    })
+                    .map(|item| (*key, item)),
+            );
         }
         // Sort by name lexically
         nav_items.sort_unstable_by(|a, b| LANGUAGE_SORTER.compare(&a.1.name(), &b.1.name()));
         // Add items to nav model
         for (i, (key, item)) in nav_items.into_iter().enumerate() {
             nav_model = nav_model.insert(|mut b| {
-                b = b.text(item.name()).data(MounterData(key, item.clone()));
+                b = b
+                    .text(item.name())
+                    .data(MounterData(key, item.clone()))
+                    .data(if item.is_remote() {
+                        Section::Network
+                    } else {
+                        Section::Drives
+                    });
                 if let Some(path) = item.path() {
                     b = b.data(Location::Path(path));
                 }
@@ -937,6 +1032,7 @@ impl App {
         }
 
         self.nav_model = nav_model.build();
+        self.nav_groups = crate::places::split(&self.nav_model);
 
         self.activate_nav_model_location(&self.tab.location.clone());
     }
@@ -1058,6 +1154,7 @@ impl Application for App {
             modifiers: Modifiers::empty(),
             mounter_items: FxHashMap::default(),
             nav_model: segmented_button::ModelBuilder::default().build(),
+            nav_groups: Vec::new(),
             result_opt: None,
             search_id: widget::Id::new("Dialog File Search"),
             tab,
@@ -1079,7 +1176,8 @@ impl Application for App {
     }
 
     fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<'_, Message>> {
-        if !self.core.window.show_context {
+        // Under the palette the folder view draws its own detail panel.
+        if !self.core.window.show_context || crate::palette::ladder().is_some() {
             return None;
         }
 
@@ -1205,14 +1303,18 @@ impl Application for App {
     }
 
     fn footer(&self) -> Option<Element<'_, Message>> {
-        Some(self.button_view())
+        // Under the palette the buttons close the sheet instead (see view).
+        crate::palette::ladder()
+            .is_none()
+            .then(|| self.button_view())
     }
 
     fn header_end(&self) -> Vec<Element<'_, Message>> {
         let mut elements = Vec::with_capacity(3);
 
         if let Some(term) = self.search_get() {
-            if self.core.is_condensed() {
+            // Under the palette search is a full-width bar over the items, as in the window.
+            if self.core.is_condensed() || crate::palette::ladder().is_some() {
                 elements.push(
                     //TODO: selected state is not appearing different
                     widget::button::icon(widget::icon::from_name("system-search-symbolic"))
@@ -1260,7 +1362,8 @@ impl Application for App {
     }
 
     fn nav_bar(&self) -> Option<Element<'_, cosmic::Action<Self::Message>>> {
-        if !self.core().nav_bar_active() {
+        // Under the palette the places panel stands in the sheet instead (see view).
+        if !self.core().nav_bar_active() || crate::palette::ladder().is_some() {
             return None;
         }
 
@@ -1297,6 +1400,7 @@ impl Application for App {
 
     fn on_nav_select(&mut self, entity: segmented_button::Entity) -> Task<Message> {
         self.nav_model.activate(entity);
+        crate::places::sync(&mut self.nav_groups, Some(entity));
         if let Some(location) = self.nav_model.data::<Location>(entity) {
             let message = Message::TabMessage(tab::Message::Location(location.clone()));
             return self.update(message);
@@ -1680,6 +1784,9 @@ impl Application for App {
                     return window::close(self.flags.window_id);
                 }
             }
+            Message::NavPlace(entity) => {
+                return self.on_nav_select(entity);
+            }
             Message::Preview => {
                 self.context_page = ContextPage::Preview(None, PreviewKind::Selected);
                 return self.with_dialog_config(|config| {
@@ -1939,14 +2046,20 @@ impl Application for App {
     fn view(&self) -> Element<'_, Message> {
         let cosmic_theme::Spacing { space_xxs, .. } = theme::spacing();
 
+        let palette = crate::palette::ladder().is_some();
         let mut col = widget::column::with_capacity(2);
 
-        if self.core.is_condensed()
+        if (self.core.is_condensed() || palette)
             && let Some(term) = self.search_get()
         {
+            let placeholder = if palette {
+                fl!("search-placeholder")
+            } else {
+                String::new()
+            };
             col = col.push(
                 widget::container(
-                    widget::text_input::search_input("", term)
+                    widget::text_input::search_input(placeholder, term)
                         .width(Length::Fill)
                         .id(self.search_id.clone())
                         .on_clear(Message::SearchClear)
@@ -1961,6 +2074,23 @@ impl Application for App {
                 .view(&self.key_binds, &self.modifiers, false, &[])
                 .map(Message::TabMessage),
         );
+
+        if palette {
+            // The window's sheet: rails above and below, places beside the items, the buttons
+            // where the window has its ledger, the grid over everything.
+            let body = widget::row::with_capacity(2)
+                .push_maybe(self.places())
+                .push(col)
+                .spacing(6)
+                .height(Length::Fill);
+            let sheet = widget::column::with_children([
+                crate::yorha::dot_rail(true),
+                widget::container(body).padding([6, 8, 0, 8]).into(),
+                crate::yorha::dot_rail(false),
+                self.button_view(),
+            ]);
+            return cosmic::iced::widget::stack![sheet, crate::yorha::grid_texture()].into();
+        }
 
         col.into()
     }

@@ -90,6 +90,147 @@ open-in-new-tab = Open in new tab
 open-in-new-window = Open in new window
 open-item-location = Open item location
 find-similar = Find similar files
+organize = Organize
+organize-planning = Planning {$n} {$n ->
+    [one] file
+   *[other] files
+}
+organize-planning-start = Planning…
+organize-waited = {$s} s so far
+organize-progress = {$done} of {$total} planned, {$s} s so far
+organize-new = New
+organize-move = Move {$n}
+organize-every-file = Show every file
+organize-summary = {$total} {$total ->
+    [one] file
+   *[other] files
+}: {$moving} move into {$folders} {$folders ->
+    [one] folder
+   *[other] folders
+} ({$new} new), {$asking} to ask about, {$staying} {$staying ->
+    [one] stays
+   *[other] stay
+}
+organize-summary-none = {$total} {$total ->
+    [one] file
+   *[other] files
+}: nothing ticked to move, {$asking} to ask about, {$staying} {$staying ->
+    [one] stays
+   *[other] stay
+}
+organize-all-from = all from {$folder}
+organize-all-from-flat = all from {$folder}, subfolders not included
+organize-no-subfolders = Subfolders not included
+organize-tab-move = Move
+organize-tab-ask = Ask
+organize-tab-stay = Stay
+organize-legend-move = Move {$n}
+organize-legend-ask = Ask {$n}
+organize-legend-stay = Stay {$n}
+organize-staying = Staying
+organize-staying-in = Staying in {$folder}
+organize-folders = {$n} {$n ->
+    [one] folder
+   *[other] folders
+}
+organize-filter = Filter
+organize-send-to = Send to
+organize-send-title = Send to
+organize-send-browse = Browse…
+organize-send-label = Send here
+organize-trash-copy = Trash this copy
+organize-no-match = No files match
+organize-sent-note = you picked this folder
+organize-why-yours = Where you sent them
+organize-name-label = Name
+organize-name-empty = Give the new folder a name
+organize-name-slash = A folder name can't hold a /
+organize-name-dots = A folder can't be named . or ..
+organize-name-hidden = A name starting with a dot hides the folder
+organize-name-bad = Not a name the disk takes: too long, or a NUL in it
+organize-discard-title = Discard changes?
+organize-discard-body = The ticks, names and folders you changed in this plan will be lost.
+organize-discard = Discard
+organize-keep-editing = Keep editing
+organize-to = To
+organize-from = From
+organize-in = In
+organize-files = {$n ->
+    [one] file
+   *[other] files
+}
+organize-photos = {$n ->
+    [one] photo
+   *[other] photos
+}
+organize-say-make = Make a new folder {$folder} and move {$n} {$noun}
+organize-say-move = Move {$n} {$noun} into {$folder}
+organize-say-maybe-make = Maybe make a new folder {$folder} and move {$n} {$noun}
+organize-say-maybe-move = Maybe move {$n} {$noun} into {$folder}
+organize-say-join = Move {$n} {$noun} into the existing folder {$folder}
+organize-say-maybe-join = Maybe move {$n} {$noun} into the existing folder {$folder}
+organize-say-unticked = {$said}; {$n} more unticked
+organize-leave = {$n ->
+    [one] Leave 1 file where it is: {$why}
+   *[other] Leave {$n} files where they are: {$why}
+}
+organize-more = +{$n} more
+organize-fewer = Fewer
+organize-col-file = File
+organize-col-to = Goes to
+organize-col-why = Why
+organize-n-move = {$n} move
+organize-n-ask = {$n} ask
+organize-n-stay = {$n} stay
+organize-stays = stays here
+organize-moved-one = Moved {$n} {$n ->
+    [one] file
+   *[other] files
+} into {$folder}
+organize-moved = Moved {$n} {$n ->
+    [one] file
+   *[other] files
+} into {$folders} folders, most into {$top}
+organize-moved-left = {$said}; {$left} left where {$left ->
+    [one] it was
+   *[other] they were
+}
+organize-status = organized {$n} {$n ->
+    [one] file
+   *[other] files
+} into {$folders} {$folders ->
+    [one] folder
+   *[other] folders
+}
+organize-and = {$a} and {$b}
+organize-trashed = {$said}; {$n} {$n ->
+    [one] copy
+   *[other] copies
+} to the trash
+organize-summary-trash = {$said}; {$n} {$n ->
+    [one] copy
+   *[other] copies
+} to trash
+organize-keep-copy = Keep this copy
+organize-will-trash = will be trashed
+organize-unrename = Undo rename
+organize-carry = Also move {$from} to {$to}?
+organize-carry-more = Also move {$from} to {$to}, and {$n} more {$n ->
+    [one] folder
+   *[other] folders
+} inside?
+organize-carry-yes = Yes
+organize-carry-no = No, keep it
+organize-gone = The folder being organized is gone; the plan was dropped
+undo-put-back = Put back {$n} {$n ->
+    [one] file
+   *[other] files
+}
+undo-nothing = Nothing to undo
+undo-already = Already put back
+undo-failed = Undo failed: is ariadne running?
+organize-nothing = Nothing moved
+organize-failed = Organize failed: is ariadne running?
 folder-summary = Summary
 inbox = Inbox
 inbox-empty = Nothing new
@@ -402,6 +543,9 @@ view = View
 grid-view = Grid view
 map-view = Map view
 list-view = List view
+view-grid = Grid
+view-list = List
+view-map = Map
 show-hidden-files = Show hidden files
 list-directories-first = List directories first
 gallery-preview = Gallery preview
